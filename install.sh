@@ -178,15 +178,77 @@ else
   echo -e "  ${DIM}(para instalar em outro local: cd /outro/diretorio && curl ... | bash)${RESET}"
   echo ""
 
-  # ── GHCR Token (obrigatório) ──────────────────────────────────────────────
-  echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} GitHub Container Registry"
-  echo -e "  Crie um token em: ${CYAN}https://github.com/settings/tokens${RESET}"
-  echo -e "  Escopo necessário: ${CYAN}read:packages${RESET}"
+  # ── Chave de Ativação pgwho (valida via site e obtém token GHCR) ──────────
+  LICENSE_API_URL="${PGWHO_LICENSE_API:-https://pgwho.com/crm/api.php?action=validate_license}"
+
+  # O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
+  ghcr_token_works() {
+    local user="$1" token="$2" code
+    code=$(curl -s -o /dev/null -w "%{http_code}" -u "${user}:${token}" \
+      "https://ghcr.io/token?scope=repository:${user}/pgwho-backend:pull&service=ghcr.io" 2>/dev/null || true)
+    [[ "$code" == "200" ]]
+  }
+
+  LICENSE_KEY_INPUT=""
+  GHCR_TOKEN_INPUT=""
+  GHCR_USER_RESOLVED="wislanmoraes"
+
+  echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Chave de Ativação pgwho (enviada por e-mail / Portal CRM)"
+  echo -e "  Formato: ${CYAN}TMA-XXXX-XXXX-...${RESET}"
   echo ""
   while true; do
-    read -rp "  GHCR_TOKEN: " GHCR_TOKEN_INPUT </dev/tty
-    [[ -n "$GHCR_TOKEN_INPUT" ]] && break
-    echo -e "  ${RED}Token obrigatório.${RESET} Sem ele não é possível baixar as imagens."
+    read -rp "  LICENSE_KEY: " RAW_KEY_INPUT </dev/tty
+    RAW_KEY_INPUT="$(echo "$RAW_KEY_INPUT" | tr -d '[:space:]')"
+    if [[ -z "$RAW_KEY_INPUT" ]]; then
+      echo -e "  ${RED}Chave obrigatória.${RESET} Informe sua Chave de Ativação para validar e liberar o download."
+      continue
+    fi
+
+    # Suporte legado caso seja informado um PAT ghp_ diretamente
+    if [[ "$RAW_KEY_INPUT" == ghp_* ]] || [[ "$RAW_KEY_INPUT" == github_pat_* ]]; then
+      GHCR_TOKEN_INPUT="$RAW_KEY_INPUT"
+      info "Token GHCR direto informado ✓"
+      break
+    fi
+
+    info "Validando Chave de Ativação em pgwho.com..."
+    VALIDATION_JSON=$(curl -fsSL -X POST "$LICENSE_API_URL" \
+      -H "Content-Type: application/json" \
+      -d "{\"access_key\":\"${RAW_KEY_INPUT}\"}" 2>/dev/null || true)
+
+    if [[ -z "$VALIDATION_JSON" ]]; then
+      error "Não foi possível contatar o servidor de licenças (${LICENSE_API_URL})."
+      continue
+    fi
+
+    IS_VALID=$(echo "$VALIDATION_JSON" | grep -oE '"valid"\s*:\s*(true|false)' | head -1 | grep -oE '(true|false)' || echo "false")
+    if [[ "$IS_VALID" != "true" ]]; then
+      ERR_MSG=$(echo "$VALIDATION_JSON" | sed -n 's/.*"message"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+      error "Chave inválida ou expirada: ${ERR_MSG:-Verifique sua chave no Portal CRM.}"
+      continue
+    fi
+
+    EXTRACTED_TOKEN=$(echo "$VALIDATION_JSON" | sed -n 's/.*"github_token"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+    EXTRACTED_USER=$(echo "$VALIDATION_JSON" | sed -n 's/.*"ghcr_user"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+    EXTRACTED_EXP=$(echo "$VALIDATION_JSON" | sed -n 's/.*"expires_at"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$EXTRACTED_TOKEN" ]]; then
+      error "Licença válida, porém o token de pacotes não pôde ser obtido. Contate o suporte pgwho."
+      continue
+    fi
+
+    if ! ghcr_token_works "${EXTRACTED_USER:-wislanmoraes}" "$EXTRACTED_TOKEN"; then
+      # A chave é válida: guarda para o .env mesmo que o token venha de outro lugar.
+      LICENSE_KEY_INPUT="$RAW_KEY_INPUT"
+      error "Licença válida, porém o token de pacotes não foi aceito pelo GHCR (recusado ou GHCR inacessível). Informe um token do GitHub (ghp_...) com read:packages ou contate o suporte pgwho."
+      continue
+    fi
+
+    LICENSE_KEY_INPUT="$RAW_KEY_INPUT"
+    GHCR_TOKEN_INPUT="$EXTRACTED_TOKEN"
+    GHCR_USER_RESOLVED="${EXTRACTED_USER:-wislanmoraes}"
+    info "Licença validada com sucesso! (Válida até: ${EXTRACTED_EXP:-vigente}) ✓"
+    break
   done
   echo ""
 
@@ -217,7 +279,8 @@ else
   echo -e "  ${DIM}DB_PASSWORD     = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}SECRET_KEY      = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}ANTHROPIC_API_KEY = ${ANTHROPIC_API_KEY:-não configurado}${RESET}"
-  echo -e "  ${DIM}GHCR_TOKEN      = ${GHCR_TOKEN_INPUT:0:8}…(oculto)${RESET}"
+  [[ -n "$LICENSE_KEY_INPUT" ]] && echo -e "  ${DIM}LICENSE_KEY     = ${LICENSE_KEY_INPUT:0:13}…${RESET}"
+  echo -e "  ${DIM}GHCR_TOKEN      = (sincronizado via licença)${RESET}"
   echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
   echo ""
 
@@ -242,9 +305,10 @@ COLLECTOR_INTERVAL_SECONDS=60
 ACTIVITY_SAMPLE_INTERVAL_SECONDS=5
 ALERT_EVALUATION_INTERVAL_SECONDS=60
 
-# ── Atualização ───────────────────────────────────────────────────────────────
+# ── Licenciamento & Atualização ───────────────────────────────────────────────
+LICENSE_KEY=${LICENSE_KEY_INPUT}
 GHCR_TOKEN=${GHCR_TOKEN_INPUT}
-GHCR_USER=wislanmoraes
+GHCR_USER=${GHCR_USER_RESOLVED}
 EOF
 
   info ".env criado ✓"

@@ -127,6 +127,61 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
   exit 1
 fi
 
+# ── Validação da Chave de Ativação via site (sincroniza token do GitHub) ─────
+
+LICENSE_API_URL="${PGWHO_LICENSE_API:-https://pgwho.com/crm/api.php?action=validate_license}"
+
+# O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
+ghcr_token_works() {
+  local user="$1" token="$2" code
+  code=$(curl -s -o /dev/null -w "%{http_code}" -u "${user}:${token}" \
+    "https://ghcr.io/token?scope=repository:${user}/pgwho-backend:pull&service=ghcr.io" 2>/dev/null || true)
+  [[ "$code" == "200" ]]
+}
+
+if [[ -n "${LICENSE_KEY:-}" ]] && command -v curl &>/dev/null; then
+  info "Validando Chave de Ativação no site pgwho.com..."
+  VALIDATION_JSON=$(curl -fsSL -X POST "$LICENSE_API_URL" \
+    -H "Content-Type: application/json" \
+    -d "{\"access_key\":\"${LICENSE_KEY}\"}" 2>/dev/null || true)
+
+  if [[ -n "$VALIDATION_JSON" ]]; then
+    IS_VALID=$(echo "$VALIDATION_JSON" | grep -oE '"valid"\s*:\s*(true|false)' | head -1 | grep -oE '(true|false)' || echo "false")
+    if [[ "$IS_VALID" != "true" ]]; then
+      ERR_MSG=$(echo "$VALIDATION_JSON" | sed -n 's/.*"message"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+      error "Sua Chave de Ativação está expirada ou inválida: ${ERR_MSG:-Renove no Portal do Cliente (https://pgwho.com/crm/portal.php).}"
+      exit 1
+    fi
+
+    NEW_GHCR_TOKEN=$(echo "$VALIDATION_JSON" | sed -n 's/.*"github_token"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+    NEW_GHCR_USER=$(echo "$VALIDATION_JSON" | sed -n 's/.*"ghcr_user"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -n "$NEW_GHCR_TOKEN" && "$NEW_GHCR_TOKEN" == "${GHCR_TOKEN:-}" ]]; then
+      info "Chave validada ✓ (credenciais de pacote já atualizadas)"
+    elif [[ -n "$NEW_GHCR_TOKEN" ]]; then
+      NEW_GHCR_USER="${NEW_GHCR_USER:-$GHCR_USER}"
+      # Só substitui o token do .env se o novo funcionar: um token revogado no
+      # servidor de licenças não pode apagar um token local que ainda funciona.
+      if ghcr_token_works "$NEW_GHCR_USER" "$NEW_GHCR_TOKEN"; then
+        GHCR_TOKEN="$NEW_GHCR_TOKEN"
+        GHCR_USER="$NEW_GHCR_USER"
+        if [[ -w "$SCRIPT_DIR/.env" ]]; then
+          if grep -q '^GHCR_TOKEN=' "$SCRIPT_DIR/.env"; then
+            sed -i "s|^GHCR_TOKEN=.*|GHCR_TOKEN=${GHCR_TOKEN}|" "$SCRIPT_DIR/.env" 2>/dev/null || true
+          else
+            echo "GHCR_TOKEN=${GHCR_TOKEN}" >> "$SCRIPT_DIR/.env"
+          fi
+        fi
+        info "Chave validada e credenciais de pacote sincronizadas ✓"
+      else
+        warn "O token de pacotes do servidor de licenças não foi aceito pelo GHCR (recusado ou GHCR inacessível) — mantendo o token atual do .env."
+      fi
+    fi
+  else
+    warn "Não foi possível contatar o servidor de licenças — utilizando credenciais em cache."
+  fi
+fi
+
 # ── Login no registry ─────────────────────────────────────────────────────────
 
 if [[ -n "${GHCR_TOKEN:-}" ]]; then
@@ -156,6 +211,37 @@ if [[ -z "${DATA_VOLUME_NAME:-}" ]] && docker volume inspect pgwatchai_timescale
     sed -i 's/pgwho_timescaledb_data/pgwatchai_timescaledb_data/g' "$SCRIPT_DIR/$COMPOSE_FILE" 2>/dev/null || true
     info "Volume legado (pgwatchai_timescaledb_data) detectado e preservado no compose."
   fi
+fi
+
+# ── Espaço em disco ───────────────────────────────────────────────────────────
+# As imagens novas (~2,5 GB) são baixadas antes das antigas saírem. Sem espaço,
+# o pull enche o disco e o banco não sobe depois ("No space left on device"),
+# deixando a aplicação fora do ar. Checar ANTES de parar qualquer coisa.
+
+MIN_FREE_GB="${PGWHO_MIN_FREE_GB:-4}"
+
+info "Removendo imagens antigas sem tag antes de baixar..."
+docker image prune -f >/dev/null 2>&1 || true
+
+DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+# Dentro do updater, o caminho do host não existe; "/" do container fica no
+# mesmo disco que guarda as imagens do Docker.
+[[ -n "$DOCKER_ROOT" && -d "$DOCKER_ROOT" ]] || DOCKER_ROOT="/"
+FREE_KB=$(df -Pk "$DOCKER_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)
+if [[ "$FREE_KB" =~ ^[0-9]+$ ]]; then
+  FREE_GB=$(awk -v kb="$FREE_KB" 'BEGIN {printf "%.1f", kb / 1048576}')
+  if (( FREE_KB < MIN_FREE_GB * 1048576 )); then
+    error "Espaço livre insuficiente para atualizar: ${FREE_GB} GB (mínimo ${MIN_FREE_GB} GB)."
+    error "Nada foi alterado: a versão atual continua no ar."
+    error "Libere espaço no host e rode de novo, por exemplo:"
+    error "  docker image prune -a      # imagens que nenhum container usa"
+    error "  journalctl --vacuum-size=200M"
+    error "  df -h /                    # conferir"
+    exit 1
+  fi
+  info "Espaço livre: ${FREE_GB} GB ✓"
+else
+  warn "Não foi possível medir o espaço livre — seguindo com a atualização."
 fi
 
 # ── Baixar novas imagens ──────────────────────────────────────────────────────
@@ -230,6 +316,13 @@ fi
 
 info "Removendo imagens não utilizadas para liberar espaço..."
 docker image prune -f
+# Imagens do nome antigo (pgwatchai-*) continuam com tag depois do rebrand e o
+# prune acima não as remove. docker rmi recusa as que algum container ainda usa.
+LEGACY_IMAGES=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '/pgwatchai-' || true)
+if [[ -n "$LEGACY_IMAGES" ]]; then
+  echo "$LEGACY_IMAGES" | xargs docker rmi >/dev/null 2>&1 || true
+  info "Imagens antigas pgwatchai-* removidas."
+fi
 
 # ── Verificação final ─────────────────────────────────────────────────────────
 
