@@ -113,6 +113,15 @@ services:
       # o .env com DB_PASSWORD/SECRET_KEY/GHCR_TOKEN em texto puro — sem
       # necessidade nenhuma. Removido; só o socket continua preciso.
       - /var/run/docker.sock:/var/run/docker.sock  # necessário para WatchShell / terminal
+    # PostgreSQL no próprio servidor: cadastre a instância com host
+    # host.docker.internal. No Linux esse nome só existe com esta linha (o
+    # Docker Desktop do Mac/Windows já o cria) e aponta para o IP fixo do Docker
+    # no host (docker0, normalmente 172.17.0.1). O gateway da rede pgwho_internal
+    # (172.18.0.1, 172.19.0.1...) muda se a rede for recriada; esse nome não.
+    # No PostgreSQL: listen_addresses que inclua esse IP (ex.: '*', com o acesso
+    # fechado pelo pg_hba e pelo firewall) e pg_hba liberando 172.16.0.0/12.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - pgwho_internal
     depends_on:

@@ -28,6 +28,20 @@ O instalador irá:
 
 Ao final, a URL de acesso e o login padrão serão exibidos.
 
+## PostgreSQL no mesmo servidor
+
+Para monitorar um PostgreSQL instalado no próprio servidor do pgwho, cadastre a instância com
+host **`host.docker.internal`**. Não use `localhost` (dentro do container é o próprio pgwho) nem o
+IP da rede Docker do pgwho (`172.18.0.1`, `172.19.0.1`...), que muda se a rede for recriada.
+
+No PostgreSQL:
+
+- `listen_addresses` precisa incluir o IP do Docker no host (normalmente `172.17.0.1`). O mais
+  simples é `'*'`, mantendo a porta 5432 fechada para a internet no firewall. Mudar esse
+  parâmetro exige reiniciar o PostgreSQL.
+- `pg_hba.conf` precisa liberar as redes Docker para o usuário de monitoramento, por exemplo:
+  `host  all  monitor  172.16.0.0/12  scram-sha-256`
+
 ## Atualização
 
 Quando uma nova versão estiver disponível, um badge verde aparecerá na interface.
