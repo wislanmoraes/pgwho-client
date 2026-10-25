@@ -47,7 +47,9 @@ services:
     # já publicada aqui — só suba. (main.py roda ALTER EXTENSION UPDATE no
     # boot, então subir a versão sempre migra os clientes pra frente
     # sozinho; descer nunca vai funcionar, e trava instalações existentes.)
-    image: timescale/timescaledb:2.29.2-pg18
+    # TimescaleDB + pg_cron. A versão do TimescaleDB fica em db/Dockerfile
+    # (TIMESCALE_TAG) e segue a regra acima: só sobe, nunca desce.
+    image: ghcr.io/wislanmoraes/pgwho-db:${IMAGE_TAG:-latest}
     container_name: pgwho_db
     # Issue #57/#61: pg_stat_statements + auto_explain (limiar 10ms) no banco
     # INTERNO — telemetria do próprio backend, além da que já existe pras
@@ -58,7 +60,14 @@ services:
     # Banco) em vez de texto livre quebrado em várias linhas.
     command: [
       "postgres",
-      "-c", "shared_preload_libraries=timescaledb,pg_stat_statements,auto_explain",
+      "-c", "shared_preload_libraries=timescaledb,pg_stat_statements,auto_explain,pg_cron",
+      # pg_cron (imagem db/Dockerfile): Gravador de Emergência no próprio banco
+      # do pgwho. Background worker: o Gravador grava mesmo com as conexões
+      # esgotadas. max_worker_processes acomoda o pg_cron ao lado dos workers
+      # do TimescaleDB e das consultas paralelas.
+      "-c", "cron.database_name=${DB_NAME:-pgwho}",
+      "-c", "cron.use_background_workers=on",
+      "-c", "max_worker_processes=32",
       "-c", "pg_stat_statements.track=all",
       "-c", "auto_explain.log_min_duration=10ms",
       "-c", "auto_explain.log_analyze=off",
