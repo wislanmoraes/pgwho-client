@@ -73,6 +73,15 @@ echo -e "  Instalação inicial — PostgreSQL Monitoring with AI\n"
 
 section "Verificando pré-requisitos"
 
+# Requisitos recomendados (docs/requisitos.md): só avisa, nunca interrompe.
+CPUS_HOST=$(nproc 2>/dev/null || echo 0)
+MEM_KB_HOST=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_GB_HOST=$(( ${MEM_KB_HOST:-0} / 1024 / 1024 ))
+if [[ "$CPUS_HOST" -gt 0 && "$CPUS_HOST" -lt 6 ]] || [[ "${MEM_KB_HOST:-0}" -gt 0 && "$MEM_GB_HOST" -lt 11 ]]; then
+  warn "Servidor com ${CPUS_HOST} CPU(s) e ${MEM_GB_HOST} GB: o recomendado é 6 CPUs e 12 GB."
+  warn "O pgwho funciona, mas pode ficar lento com muitas instâncias monitoradas."
+fi
+
 for cmd in docker curl openssl; do
   if ! command -v "$cmd" &>/dev/null; then
     error "$cmd não encontrado. Instale antes de continuar."
@@ -311,6 +320,7 @@ GHCR_TOKEN=${GHCR_TOKEN_INPUT}
 GHCR_USER=${GHCR_USER_RESOLVED}
 EOF
 
+  chmod 600 .env   # senha e tokens; os containers que o leem rodam como root
   info ".env criado ✓"
 fi
 

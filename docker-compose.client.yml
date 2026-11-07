@@ -51,6 +51,8 @@ services:
     # (TIMESCALE_TAG) e segue a regra acima: só sobe, nunca desce.
     image: ghcr.io/wislanmoraes/pgwho-db:${IMAGE_TAG:-latest}
     container_name: pgwho_db
+    # Consulta paralela e índices usam /dev/shm; o padrão do Docker é 64 MB.
+    shm_size: ${DB_SHM_SIZE:-512m}
     # Issue #57/#61: pg_stat_statements + auto_explain (limiar 10ms) no banco
     # INTERNO — telemetria do próprio backend, além da que já existe pras
     # instâncias monitoradas. Ver docker-compose.dev.yml (repo privado) pro
@@ -68,6 +70,22 @@ services:
       "-c", "cron.database_name=${DB_NAME:-pgwho}",
       "-c", "cron.use_background_workers=on",
       "-c", "max_worker_processes=32",
+      # Recursos do banco (Issue #149). Na linha de comando, vencem o postgresql.conf
+      # que o timescaledb-tune gerou uma única vez, na criação do banco. Sem paralelismo
+      # nas conexões do pgwho (database.py); max_worker_processes acima não é tuning.
+      "-c", "shared_buffers=${DB_SHARED_BUFFERS:-2GB}",
+      "-c", "effective_cache_size=${DB_EFFECTIVE_CACHE_SIZE:-6GB}",
+      "-c", "work_mem=${DB_WORK_MEM:-32MB}",
+      "-c", "maintenance_work_mem=${DB_MAINTENANCE_WORK_MEM:-1GB}",
+      "-c", "autovacuum_work_mem=${DB_AUTOVACUUM_WORK_MEM:-512MB}",
+      "-c", "max_wal_size=${DB_MAX_WAL_SIZE:-4GB}",
+      "-c", "min_wal_size=${DB_MIN_WAL_SIZE:-1GB}",
+      "-c", "temp_file_limit=${DB_TEMP_FILE_LIMIT:-20GB}",
+      "-c", "wal_compression=on",
+      "-c", "checkpoint_timeout=15min",
+      "-c", "track_io_timing=on",
+      "-c", "log_lock_waits=on",
+      "-c", "log_temp_files=2048",
       "-c", "pg_stat_statements.track=all",
       "-c", "auto_explain.log_min_duration=10ms",
       "-c", "auto_explain.log_analyze=off",
@@ -92,8 +110,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 5g
+          cpus: "${DB_CPUS:-4.0}"
+          memory: ${DB_MEMORY:-8g}
     # TimescaleDB nunca expõe porta para o host — acessível apenas internamente
 
   # ── Backend (FastAPI) ─────────────────────────────────────────────────────
@@ -146,8 +164,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 1.5g
+          cpus: "${BACKEND_CPUS:-2.0}"
+          memory: ${BACKEND_MEMORY:-2g}
     # Backend nunca expõe porta para o host — acessível via nginx do frontend
 
   # ── Frontend (React + Nginx) ──────────────────────────────────────────────
@@ -162,7 +180,7 @@ services:
     depends_on:
       - backend
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
       interval: 15s
       timeout: 5s
       retries: 5
