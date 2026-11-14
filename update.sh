@@ -68,6 +68,57 @@ if [[ "${SKIP_SELF_UPDATE:-0}" != "1" ]] && [[ -t 0 ]] && command -v curl &>/dev
   fi
 fi
 
+# ── A raiz do servidor aceita a montagem rslave? ─────────────────────────────
+# Desde a v0.4.33 o compose monta o / do servidor no backend com propagação
+# rslave (System Health, Issue #158). O Docker só aceita isso com a raiz do
+# servidor marcada como montagem compartilhada — o padrão com systemd. Sem
+# ela o backend NÃO SOBE ("path / is mounted on / but it is not a shared or
+# slave mount"). Este teste roda ANTES de trocar o compose: se falhar, o
+# update para e o cliente segue na versão atual, funcionando.
+#   0 = aceita   1 = recusa   2 = não deu para testar
+root_rslave_ok() {
+  # Caminhos substituíveis só nos testes (.github/ci/rslave-preflight-tests.sh).
+  local mountinfo="${PGWHO_MOUNTINFO:-/proc/self/mountinfo}" dockerenv="${PGWHO_DOCKERENV:-/.dockerenv}"
+  # Executado direto no servidor (à mão, ou pelo install.sh): o mountinfo
+  # do próprio processo é o do servidor.
+  if [[ ! -f "$dockerenv" && -r "$mountinfo" ]]; then
+    awk '$5 == "/" { found = 1; if ($0 ~ / shared:[0-9]+/) ok = 1 } END { exit found ? (ok ? 0 : 1) : 2 }' \
+      "$mountinfo"
+    return $?
+  fi
+  # Dentro do sidecar updater o mountinfo é o do container: pergunta ao
+  # próprio Docker, com uma imagem que já está no servidor (nunca baixa nada:
+  # servidores com firewall só liberam o ghcr.io, e o Docker Hub limita pulls).
+  command -v docker &>/dev/null || return 2
+  local img out
+  img=$(docker inspect --format '{{.Config.Image}}' pgwho_backend 2>/dev/null || true)
+  [[ -n "$img" ]] || img=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -m1 'pgwho-backend' || true)
+  [[ -n "$img" ]] || return 2
+  if out=$(docker run --rm --pull never --entrypoint true \
+             --mount type=bind,source=/,target=/host/root,readonly,bind-propagation=rslave "$img" 2>&1); then
+    return 0
+  fi
+  grep -qi "shared or slave" <<<"$out" && return 1
+  return 2
+}
+
+rslave_preflight() {
+  local new_compose="$1" rc=0
+  grep -q 'propagation: rslave' "$new_compose" 2>/dev/null || return 0
+  root_rslave_ok || rc=$?
+  case $rc in
+    0) info "Montagem da raiz do servidor compatível ✓" ;;
+    1) error "A raiz (/) do servidor não é uma montagem compartilhada: a nova versão não subiria o backend."
+       error "Rode no servidor, como root:  mount --make-rshared /"
+       error "e deixe isso no boot do servidor (sistemas com systemd já fazem isso). Depois atualize de novo."
+       error "Nada foi alterado: o pgwho continua na versão atual."
+       return 1 ;;
+    *) warn "Não foi possível testar a montagem da raiz do servidor (sem imagem local do backend) — continuando."
+       warn "Se o backend não subir com 'not a shared or slave mount', rode no servidor: mount --make-rshared /" ;;
+  esac
+  return 0
+}
+
 # ── Auto-atualização do docker-compose.client.yml ────────────────────────────
 # Roda sempre (independente de SKIP_SELF_UPDATE) para garantir que novos
 # serviços (ex: updater sidecar) sejam adicionados ao compose do cliente.
@@ -78,6 +129,10 @@ if command -v curl &>/dev/null; then
   if curl -fsSL "$COMPOSE_URL" -o "$COMPOSE_TMP" 2>/dev/null; then
     TARGET_COMPOSE="$SCRIPT_DIR/${COMPOSE_FILE:-docker-compose.client.yml}"
     if ! cmp -s "$COMPOSE_TMP" "$TARGET_COMPOSE"; then
+      if ! rslave_preflight "$COMPOSE_TMP"; then
+        rm -f "$COMPOSE_TMP"
+        exit 1
+      fi
       info "docker-compose.client.yml atualizado."
       # Achado ao vivo num cliente: este arquivo é montado no sidecar
       # `updater` como bind mount de ARQUIVO ÚNICO (ver docker-compose.

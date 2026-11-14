@@ -131,6 +131,9 @@ services:
       WATCHSHELL_IMAGE: ghcr.io/wislanmoraes/pgwho-watchshell:${IMAGE_TAG:-latest}
       GHCR_USER:  ${GHCR_USER:-wislanmoraes}
       GHCR_TOKEN: ${GHCR_TOKEN:-}
+      # Log do sistema operacional (syslog do servidor) no System Health. Desligado
+      # por padrão: traz mensagens de todos os serviços da máquina, não só do pgwho.
+      PGWHO_HOST_LOGS: ${PGWHO_HOST_LOGS:-false}
     volumes:
       # Achado numa revisão de segurança: o backend NUNCA lê/escreve nada
       # do diretório de deploy no código real (routers/updates.py) — ele só
@@ -140,6 +143,24 @@ services:
       # o .env com DB_PASSWORD/SECRET_KEY/GHCR_TOKEN em texto puro — sem
       # necessidade nenhuma. Removido; só o socket continua preciso.
       - /var/run/docker.sock:/var/run/docker.sock  # necessário para WatchShell / terminal
+      # System Health (Issue #158): CPU, memória, discos, I/O, rede e processos
+      # do SERVIDOR, não do container — mesmo arranjo do node_exporter. Somente
+      # leitura; o backend nunca escreve nesses caminhos. Sem eles a seção
+      # Servidor avisa que não tem leitura.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # rslave: montagens e desmontagens feitas no servidor depois que o backend
+      # subiu chegam aqui. Sem isso o container guarda uma cópia de cada disco
+      # montado no boot, e um `umount` no servidor (troca de disco, fsck,
+      # desanexar volume de nuvem) deixa o dispositivo ocupado até reiniciar o
+      # backend. Exige a raiz do servidor como montagem compartilhada, o padrão
+      # com systemd; sem systemd: `mount --make-rshared /` antes de subir.
+      - type: bind
+        source: /
+        target: /host/root
+        read_only: true
+        bind:
+          propagation: rslave
     # PostgreSQL no próprio servidor: cadastre a instância com host
     # host.docker.internal. No Linux esse nome só existe com esta linha (o
     # Docker Desktop do Mac/Windows já o cria) e aponta para o IP fixo do Docker

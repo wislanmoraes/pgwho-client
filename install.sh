@@ -103,6 +103,19 @@ if ! docker info &>/dev/null; then
 fi
 info "docker daemon ✓"
 
+# A raiz (/) do servidor precisa ser montagem compartilhada: o backend monta o
+# / do servidor com propagação rslave (System Health) e, sem isso, não sobe.
+# Systemd já deixa assim; sem systemd, falta um comando antes de instalar.
+MOUNTINFO="${PGWHO_MOUNTINFO:-/proc/self/mountinfo}"   # substituível só nos testes
+if [[ -r "$MOUNTINFO" ]] && \
+   ! awk '$5 == "/" { if ($0 ~ / shared:[0-9]+/) ok = 1 } END { exit ok ? 0 : 1 }' "$MOUNTINFO"; then
+  error "A raiz (/) do servidor não é uma montagem compartilhada: o backend do pgwho não subiria."
+  error "Rode como root:  mount --make-rshared /"
+  error "e deixe isso no boot do servidor (sistemas com systemd já fazem isso). Depois rode o instalador de novo."
+  exit 1
+fi
+info "montagem da raiz compartilhada ✓"
+
 # ── Diretório de instalação ───────────────────────────────────────────────────
 
 section "Preparando diretório"

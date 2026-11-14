@@ -5,6 +5,10 @@ Monitoramento de PostgreSQL com inteligência artificial.
 ## Pré-requisitos
 
 - Docker 24+ com Docker Compose plugin
+- Linux com systemd. Sem systemd, rode `mount --make-rshared /` antes de instalar ou atualizar, e
+  também no boot do servidor: a tela System Health lê CPU, memória e discos do servidor pela raiz
+  montada em modo somente leitura. O instalador e a atualização conferem isso e, se faltar, param
+  antes de mudar qualquer coisa
 - Porta **80** liberada para entrada
 - Acesso à internet (saída 443) para pull das imagens
 - Pelo menos **4 GB livres** em disco (as imagens novas são baixadas antes de trocar as antigas)
