@@ -51,6 +51,11 @@ services:
     # (TIMESCALE_TAG) e segue a regra acima: só sobe, nunca desce.
     image: ghcr.io/wislanmoraes/pgwho-db:${IMAGE_TAG:-latest}
     container_name: pgwho_db
+    # Tempo para o checkpoint de desligamento quando o compose recria o banco
+    # (imagem ou configuração nova). O padrão de 10 s mata o postgres no meio
+    # do checkpoint (shared_buffers de GBs) e o próximo boot faz recuperação
+    # de crash, relendo o WAL.
+    stop_grace_period: 120s
     # Consulta paralela e índices usam /dev/shm; o padrão do Docker é 64 MB.
     shm_size: ${DB_SHM_SIZE:-512m}
     # Issue #57/#61: pg_stat_statements + auto_explain (limiar 10ms) no banco
@@ -106,6 +111,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      # Recuperação de crash (replay de até max_wal_size) ou boot lento: na janela
+      # de start a falha não conta, e o primeiro sucesso encerra a espera. Sem
+      # ela o banco virava unhealthy em ~50 s e o compose deixava o backend novo
+      # criado mas parado (depends_on: service_healthy).
+      start_period: 600s
     restart: unless-stopped
     deploy:
       resources:

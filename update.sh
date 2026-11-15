@@ -123,10 +123,43 @@ rslave_preflight() {
 # Roda sempre (independente de SKIP_SELF_UPDATE) para garantir que novos
 # serviços (ex: updater sidecar) sejam adicionados ao compose do cliente.
 
-COMPOSE_URL="https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/docker-compose.client.yml"
+CLIENT_RAW_URL="https://raw.githubusercontent.com/wislanmoraes/pgwho-client"
+
+# IMAGE_TAG fixado pela instalação (ambiente ou .env — o .env só é carregado
+# mais abaixo). Vazio quando segue a última versão.
+pinned_image_tag() {
+  local t="${IMAGE_TAG:-}"
+  if [[ -z "$t" && -f "$SCRIPT_DIR/.env" ]]; then
+    t=$(sed -n 's/^[[:space:]]*IMAGE_TAG[[:space:]]*=[[:space:]]*//p' "$SCRIPT_DIR/.env" | tail -1 | tr -d "\"' \r")
+  fi
+  t="${t#v}"
+  # Só caracteres de tag de imagem: o valor entra numa URL.
+  [[ "$t" =~ ^[0-9A-Za-z._-]+$ && "$t" != "latest" ]] && echo "$t"
+  return 0
+}
+
+# URLs do compose em ordem de preferência: com IMAGE_TAG=0.4.32, o compose da
+# tag v0.4.32 do pgwho-client (o que acompanha aquelas imagens); se a tag não
+# existir lá (versão anterior à publicação por tag, tag de commit), a main.
+compose_urls() {
+  local tag
+  tag=$(pinned_image_tag)
+  [[ -n "$tag" ]] && echo "$CLIENT_RAW_URL/v${tag}/docker-compose.client.yml"
+  echo "$CLIENT_RAW_URL/main/docker-compose.client.yml"
+}
+
 if command -v curl &>/dev/null; then
   COMPOSE_TMP="$(mktemp)"
-  if curl -fsSL "$COMPOSE_URL" -o "$COMPOSE_TMP" 2>/dev/null; then
+  COMPOSE_URL=""
+  for url in $(compose_urls); do
+    if curl -fsSL "$url" -o "$COMPOSE_TMP" 2>/dev/null; then
+      COMPOSE_URL="$url"
+      break
+    fi
+    [[ "$url" == */main/* ]] || warn "Compose da versão fixada não encontrado no pgwho-client ($url) — usando o da main."
+  done
+  if [[ -n "$COMPOSE_URL" ]]; then
+    [[ "$COMPOSE_URL" == */main/* ]] || info "Usando o docker-compose.client.yml da versão fixada (${COMPOSE_URL#"$CLIENT_RAW_URL"/})."
     TARGET_COMPOSE="$SCRIPT_DIR/${COMPOSE_FILE:-docker-compose.client.yml}"
     if ! cmp -s "$COMPOSE_TMP" "$TARGET_COMPOSE"; then
       if ! rslave_preflight "$COMPOSE_TMP"; then
@@ -308,28 +341,168 @@ docker compose -f "$COMPOSE_FILE" --profile tools pull watchshell
 
 # ── Reiniciar serviços ────────────────────────────────────────────────────────
 
-info "Parando containers existentes (mantendo frontend no ar)..."
-docker stop pgwho_backend pgwho_watchshell pgwho_db pgwatch_backend pgwatch_watchshell pgwatch_db 2>/dev/null || true
-docker rm   pgwho_backend pgwho_watchshell pgwho_db pgwatch_backend pgwatch_watchshell pgwatch_db 2>/dev/null || true
+# Quem recria os containers é o `docker compose up`: ele só troca o que mudou
+# (imagem ou configuração do serviço). O banco interno não é mais parado à mão
+# em toda atualização — com a mesma imagem e o mesmo serviço, segue no ar.
+# Parar à mão só sobra para o que o compose não reconhece como seu:
+# - containers pgwatch_* do nome antigo (rebrand), que nenhum compose recria;
+# - um pgwho_* de outro projeto compose (instalação feita antes do `name:` no
+#   compose, ou em outra pasta): o compose recusaria criar o container com o
+#   mesmo nome ("already in use").
+# O banco recebe tempo para o checkpoint de desligamento (o padrão do docker
+# stop, 10 s, mata o postgres no meio e obriga a recuperação de crash no boot).
+DB_STOP_TIMEOUT="${PGWHO_DB_STOP_TIMEOUT:-120}"
+DB_VOLUME="${DATA_VOLUME_NAME:-pgwho_timescaledb_data}"
 
-info "Subindo banco e backend com as novas imagens..."
-# depends_on: timescaledb: condition: service_healthy garante a ordem correta
-docker compose -f "$COMPOSE_FILE" up -d timescaledb backend
+compose_project_name() {
+  local p="${COMPOSE_PROJECT_NAME:-}"
+  [[ -n "$p" ]] || p=$(sed -n 's/^name:[[:space:]]*//p' "$COMPOSE_FILE" 2>/dev/null | head -1 | tr -d "\"' \r")
+  [[ -n "$p" ]] || p=$(basename "$(pwd)")
+  echo "$p"
+}
 
+stop_and_remove() {  # stop_and_remove <container> — só se existir
+  local c="$1" t=10
+  docker inspect "$c" >/dev/null 2>&1 || return 0
+  [[ "$c" == *_db ]] && t="$DB_STOP_TIMEOUT"
+  docker stop -t "$t" "$c" >/dev/null 2>&1 || true
+  docker rm "$c" >/dev/null 2>&1 || true
+  # Um banco antigo que continuasse de pé no mesmo volume ao lado do novo
+  # (postmasters em namespaces diferentes não se enxergam) corromperia os dados.
+  if docker inspect "$c" >/dev/null 2>&1; then
+    error "Não foi possível remover o container $c — parando a atualização antes de subir o banco novo."
+    exit 1
+  fi
+}
+
+# Volume de dados montado num container de banco (vazio se não achar).
+db_volume_of() {
+  docker inspect --format '{{range .Mounts}}{{if or (eq .Destination "/var/lib/postgresql") (eq .Destination "/var/lib/postgresql/data")}}{{.Name}}{{end}}{{end}}' "$1" 2>/dev/null || true
+}
+
+remove_foreign_containers() {  # remove_foreign_containers <container>...
+  local project c owner vol
+  project=$(compose_project_name)
+  for c in "$@"; do
+    owner=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$c" 2>/dev/null) || continue
+    [[ "$owner" != "$project" ]] || continue
+    if [[ "$c" == *_db ]]; then
+      # Recriado pelo compose, o banco monta $DB_VOLUME. Se o container antigo
+      # usa outro volume, o banco novo nasceria vazio (initdb) e a atualização
+      # pareceria perda total — os dados estão no volume antigo.
+      vol=$(db_volume_of "$c")
+      if [[ -n "$vol" && "$vol" != "$DB_VOLUME" ]]; then
+        error "O banco atual ($c) usa o volume '$vol', mas o compose montaria '$DB_VOLUME'."
+        error "Recriar agora subiria um banco vazio. Nada foi parado: a versão atual continua no ar."
+        error "Defina DATA_VOLUME_NAME=$vol no .env e rode a atualização de novo."
+        exit 1
+      fi
+    fi
+    warn "Container $c pertence a outro projeto compose ('${owner}', esperado '${project}') — removendo para recriar."
+    stop_and_remove "$c"
+  done
+}
+
+# O compose vai recriar o banco? (imagem ou configuração do serviço mudou).
+# Na dúvida responde que sim — o CHECKPOINT abaixo é inofensivo.
+db_will_be_recreated() {
+  local cur_img new_ref new_img cur_hash new_hash
+  docker inspect pgwho_db >/dev/null 2>&1 || return 1   # não existe: será criado, nada a parar
+  cur_hash=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' pgwho_db 2>/dev/null || true)
+  new_hash=$(docker compose -f "$COMPOSE_FILE" config --hash timescaledb 2>/dev/null | awk '{print $2}' || true)
+  [[ -n "$cur_hash" && -n "$new_hash" && "$cur_hash" == "$new_hash" ]] || return 0
+  cur_img=$(docker inspect --format '{{.Image}}' pgwho_db 2>/dev/null || true)
+  new_ref=$(docker compose -f "$COMPOSE_FILE" config --images timescaledb 2>/dev/null | head -1 || true)
+  new_img=$(docker image inspect --format '{{.Id}}' "$new_ref" 2>/dev/null || true)
+  [[ -n "$cur_img" && -n "$new_img" && "$cur_img" == "$new_img" ]] || return 0
+  return 1
+}
+
+info "Removendo containers legados (pgwatch_*), se existirem..."
+for c in pgwatch_backend pgwatch_watchshell pgwatch_db pgwatch_frontend; do
+  stop_and_remove "$c"
+done
+remove_foreign_containers pgwho_backend pgwho_watchshell pgwho_db pgwho_frontend
+
+if db_will_be_recreated; then
+  # Com o banco ainda no ar, um CHECKPOINT grava o que está sujo agora: o
+  # checkpoint de desligamento fica quase vazio e cabe folgado no tempo de
+  # parada. Se o psql morrer, o checkpoint segue no checkpointer, sem lock.
+  info "O banco interno vai ser recriado (imagem ou configuração nova) — CHECKPOINT antes de parar..."
+  docker exec pgwho_db psql -q -U "${DB_USER:-pgwho}" -d "${DB_NAME:-pgwho}" -c CHECKPOINT >/dev/null 2>&1 \
+    || warn "CHECKPOINT prévio não rodou — o banco faz o checkpoint ao desligar."
+else
+  info "Banco interno sem mudança de imagem nem de configuração — continua no ar."
+fi
+
+compose_up_db_backend() {
+  # --timeout: vale para parar os containers ANTIGOS na recriação (sem ele o
+  # compose usa o stop_grace_period gravado no container antigo — 10 s em
+  # instalações de antes desse campo).
+  docker compose -f "$COMPOSE_FILE" up -d --timeout "$DB_STOP_TIMEOUT" timescaledb backend
+}
+
+info "Subindo banco e backend com as novas imagens (o compose só recria o que mudou)..."
+# depends_on: timescaledb: condition: service_healthy garante a ordem correta.
+# Se o banco ainda não ficou saudável (recuperação de crash longa), o compose
+# desiste e o backend novo fica criado, mas parado: espera o banco e tenta de novo.
+if ! compose_up_db_backend; then
+  warn "O compose não conseguiu subir banco e backend. Últimas linhas do log do banco:"
+  docker logs --tail 30 pgwho_db 2>&1 || true
+  info "Aguardando o banco interno ficar saudável (até $(( ${PGWHO_DB_WAIT_TRIES:-200} * ${PGWHO_HEALTH_INTERVAL:-3} / 60 )) min)..."
+  for i in $(seq 1 "${PGWHO_DB_WAIT_TRIES:-200}"); do
+    st=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' pgwho_db 2>/dev/null || echo missing)
+    [[ "$st" == "healthy" ]] && break
+    (( i % 10 == 0 )) && echo "  banco: $st ($i/${PGWHO_DB_WAIT_TRIES:-200}) — $(docker logs --tail 1 pgwho_db 2>&1 | tail -1)"
+    sleep "${PGWHO_HEALTH_INTERVAL:-3}"
+  done
+  if ! compose_up_db_backend; then
+    error "Banco e backend não subiram. Últimas linhas do log do banco:"
+    docker logs --tail 60 pgwho_db 2>&1 || true
+    error "  docker compose -f $COMPOSE_FILE ps"
+    exit 1
+  fi
+fi
+
+# Espera o /health olhando o container: crash-loop (reinício ou saída) falha
+# na hora; boot lento (DDL do lifespan em base grande, ALTER EXTENSION) tem
+# até ~10 min. Só leitura — nada fica preso se o script morrer aqui.
 info "Aguardando backend ficar saudável..."
-for i in $(seq 1 30); do
-  sleep 3
+BACKEND_OK=0
+HEALTH_TRIES="${PGWHO_HEALTH_TRIES:-200}"
+restarts0=$(docker inspect --format '{{.RestartCount}}' pgwho_backend 2>/dev/null || echo 0)
+for i in $(seq 1 "$HEALTH_TRIES"); do
+  sleep "${PGWHO_HEALTH_INTERVAL:-3}"
   if docker exec pgwho_backend curl -sf http://localhost:8000/health >/dev/null 2>&1; then
     info "Backend saudável."
+    BACKEND_OK=1
     break
   fi
-  echo "  aguardando... ($i/30)"
+  read -r state restarts < <(docker inspect --format '{{.State.Status}} {{.RestartCount}}' pgwho_backend 2>/dev/null || echo "missing 0")
+  if [[ "$state" == "exited" || "$state" == "dead" || "$state" == "missing" ]] || (( ${restarts:-0} > ${restarts0:-0} )); then
+    error "O backend parou durante o boot (estado: $state, reinícios: ${restarts:-0})."
+    break
+  fi
+  (( i % 10 == 0 )) && echo "  aguardando... ($i/$HEALTH_TRIES) — $(docker logs --tail 1 pgwho_backend 2>&1 | tail -1)"
 done
 
+if [[ "$BACKEND_OK" != "1" ]]; then
+  error "O backend não respondeu em /health depois da atualização."
+  error "Últimas linhas do log do backend:"
+  docker logs --tail 60 pgwho_backend 2>&1 || true
+  error "O frontend e o updater não foram trocados. Confira o log acima e o estado dos containers:"
+  error "  docker compose -f $COMPOSE_FILE ps"
+  exit 1
+fi
+
 info "Atualizando frontend..."
-docker stop pgwho_frontend pgwatch_frontend 2>/dev/null || true
-docker rm   pgwho_frontend pgwatch_frontend 2>/dev/null || true
 docker compose -f "$COMPOSE_FILE" up -d frontend
+
+# WatchShell fica no profile 'tools': só é atualizado se estiver em uso.
+if [[ -n "$(docker ps -q --filter name='^pgwho_watchshell$' 2>/dev/null || true)" ]]; then
+  info "Atualizando WatchShell..."
+  docker compose -f "$COMPOSE_FILE" --profile tools up -d watchshell
+fi
 
 info "Subindo demais serviços..."
 # --no-recreate: não recria containers já em execução (ex: pgwho_updater que está rodando este script)
@@ -345,7 +518,7 @@ docker compose -f "$COMPOSE_FILE" up -d --no-recreate --remove-orphans
 # Se executado diretamente no terminal do host (! -f /.dockerenv), podemos
 # recriar o updater diretamente. Se executado de dentro do sidecar updater,
 # delegamos a um container auxiliar descartável usando HOST_DEPLOY_DIR.
-if [[ ! -f /.dockerenv ]]; then
+if [[ ! -f "${PGWHO_DOCKERENV:-/.dockerenv}" ]]; then
   info "Recriando serviço updater no host..."
   docker rm -f pgwatch_updater 2>/dev/null || true
   docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-deps updater
@@ -355,15 +528,21 @@ elif [[ -z "${HOST_DEPLOY_DIR:-}" ]]; then
   warn "  docker compose -f $COMPOSE_FILE up -d --force-recreate updater"
 else
   info "Agendando recriação do updater (em container auxiliar separado)..."
+  # O auxiliar usa a imagem do próprio pgwho-updater, que o pull acima já
+  # trouxe e que tem docker + docker compose — nunca baixa nada (servidores
+  # com firewall só liberam o ghcr.io, e o Docker Hub limita pulls).
+  UPDATER_IMAGE=$(docker compose -f "$COMPOSE_FILE" config --images updater 2>/dev/null | head -1 || true)
+  UPDATER_IMAGE="${UPDATER_IMAGE:-$REGISTRY/wislanmoraes/pgwho-updater:${IMAGE_TAG:-latest}}"
   # sleep 2 dá tempo do `docker run -d` retornar e este script terminar
-  # (state.push_done() no updater dispara e a UI já reporta sucesso) antes
-  # do updater antigo ser efetivamente derrubado.
-  docker run --rm -d \
+  # (o updater manda o "done" e a UI já reporta sucesso) antes do updater
+  # antigo ser efetivamente derrubado.
+  docker run --rm -d --pull never \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$HOST_DEPLOY_DIR:$HOST_DEPLOY_DIR" \
     -w "$HOST_DEPLOY_DIR" \
-    docker:27-cli \
-    sh -c "sleep 2 && docker rm -f pgwatch_updater 2>/dev/null || true; docker compose -f '$COMPOSE_FILE' up -d --force-recreate --no-deps updater" \
+    --entrypoint sh \
+    "$UPDATER_IMAGE" \
+    -c "sleep 2 && docker rm -f pgwatch_updater 2>/dev/null || true; docker compose -f '$COMPOSE_FILE' up -d --force-recreate --no-deps updater" \
     >/dev/null
 fi
 
