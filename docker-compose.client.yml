@@ -134,6 +134,11 @@ services:
       DATABASE_URL:      postgresql+asyncpg://${DB_USER:-pgwho}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME:-pgwho}
       DATABASE_URL_SYNC: postgresql://${DB_USER:-pgwho}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME:-pgwho}
       SECRET_KEY:        ${SECRET_KEY:?SECRET_KEY obrigatório}
+      # Cifra dos segredos do banco interno (Issue #228): gerada pelo install.sh/update.sh.
+      PGWHO_ENCRYPTION_KEY: ${PGWHO_ENCRYPTION_KEY:-}
+      # Licença v2 (#234): identidade da instalação, gerada pelo install.sh/update.sh.
+      PGWHO_INSTALLATION_ID: ${PGWHO_INSTALLATION_ID:-}
+      PGWHO_LICENSE_SERVER: ${PGWHO_LICENSE_SERVER:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       COLLECTOR_INTERVAL_SECONDS:        ${COLLECTOR_INTERVAL_SECONDS:-60}
       ACTIVITY_SAMPLE_INTERVAL_SECONDS:  ${ACTIVITY_SAMPLE_INTERVAL_SECONDS:-5}
@@ -165,12 +170,10 @@ services:
       # desanexar volume de nuvem) deixa o dispositivo ocupado até reiniciar o
       # backend. Exige a raiz do servidor como montagem compartilhada, o padrão
       # com systemd; sem systemd: `mount --make-rshared /` antes de subir.
-      - type: bind
-        source: /
-        target: /host/root
-        read_only: true
-        bind:
-          propagation: rslave
+      # Docker Desktop (Windows/WSL, macOS): a raiz da VM do Docker não é
+      # compartilhada e o rslave é recusado; o update.sh grava
+      # PGWHO_HOST_ROOT_MOUNT_OPTS=ro no .env (Issue #248). Não edite aqui.
+      - /:/host/root:${PGWHO_HOST_ROOT_MOUNT_OPTS:-ro,rslave}
     # PostgreSQL no próprio servidor: cadastre a instância com host
     # host.docker.internal. No Linux esse nome só existe com esta linha (o
     # Docker Desktop do Mac/Windows já o cria) e aponta para o IP fixo do Docker

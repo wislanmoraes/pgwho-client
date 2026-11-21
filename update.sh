@@ -98,13 +98,51 @@ root_rslave_ok() {
              --mount type=bind,source=/,target=/host/root,readonly,bind-propagation=rslave "$img" 2>&1); then
     return 0
   fi
-  grep -qi "shared or slave" <<<"$out" && return 1
+  # "not a shared or slave mount" ou "not a shared mount", conforme a versão do Docker.
+  grep -qiE "shared or slave|not a shared mount" <<<"$out" && return 1
   return 2
 }
 
-rslave_preflight() {
-  local new_compose="$1" rc=0
-  grep -q 'propagation: rslave' "$new_compose" 2>/dev/null || return 0
+# ── Docker Desktop (Windows/WSL, macOS) — Issue #248 ─────────────────────────
+# O daemon roda numa VM própria cuja raiz não é compartilhada: o rslave é
+# recusado e o backend não sobe. Lá o / montado é o da VM do Docker (não o do
+# Windows/Mac), então a propagação não traz ganho: a montagem fica só `ro`
+# (PGWHO_HOST_ROOT_MOUNT_OPTS, lida pelo compose). O mountinfo do shell não
+# serve para detectar isso: no WSL ele é o da distro, que tem systemd.
+# PGWHO_DOCKER_OS é substituível só nos testes.
+docker_desktop() {
+  [[ -n "${PGWHO_DOCKER_OS+x}" ]] || PGWHO_DOCKER_OS=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)
+  [[ "$PGWHO_DOCKER_OS" == *"Docker Desktop"* ]]
+}
+
+env_file_value() {  # env_file_value <VAR> <arquivo .env>
+  [[ -f "${2:-}" ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | tail -1 | tr -d "\"' \r"
+}
+
+# Grava PGWHO_HOST_ROOT_MOUNT_OPTS=ro no .env no Docker Desktop. Nunca troca um
+# valor que já esteja lá (quem definiu à mão sabe o que quer).
+host_root_opts_for_docker_desktop() {
+  local env_file="$1"
+  docker_desktop || return 0
+  [[ -f "$env_file" ]] || return 0
+  grep -q '^[[:space:]]*PGWHO_HOST_ROOT_MOUNT_OPTS[[:space:]]*=' "$env_file" && return 0
+  if [[ ! -w "$env_file" ]]; then
+    warn "Docker Desktop: o .env não pode ser alterado daqui. Rode ./update.sh no servidor uma vez."
+    return 0
+  fi
+  printf '\n# Docker Desktop: a raiz da VM do Docker não aceita a montagem rslave (Issue #248).\nPGWHO_HOST_ROOT_MOUNT_OPTS=ro\n' >> "$env_file"
+  export PGWHO_HOST_ROOT_MOUNT_OPTS=ro
+  info "Docker Desktop: raiz do servidor montada sem rslave (PGWHO_HOST_ROOT_MOUNT_OPTS=ro no .env) ✓"
+}
+
+rslave_preflight() {  # rslave_preflight <compose novo> [.env]
+  local new_compose="$1" env_file="${2:-}" rc=0 opts
+  grep -Eq 'propagation: rslave|ro,rslave\}' "$new_compose" 2>/dev/null || return 0
+  # A instalação já monta a raiz sem rslave: nada a testar.
+  opts="${PGWHO_HOST_ROOT_MOUNT_OPTS:-$(env_file_value PGWHO_HOST_ROOT_MOUNT_OPTS "$env_file")}"
+  [[ -n "$opts" && "$opts" != *rslave* ]] && return 0
+  docker_desktop && return 0
   root_rslave_ok || rc=$?
   case $rc in
     0) info "Montagem da raiz do servidor compatível ✓" ;;
@@ -124,6 +162,8 @@ rslave_preflight() {
 # serviços (ex: updater sidecar) sejam adicionados ao compose do cliente.
 
 CLIENT_RAW_URL="https://raw.githubusercontent.com/wislanmoraes/pgwho-client"
+
+host_root_opts_for_docker_desktop "$SCRIPT_DIR/.env"
 
 # IMAGE_TAG fixado pela instalação (ambiente ou .env — o .env só é carregado
 # mais abaixo). Vazio quando segue a última versão.
@@ -162,7 +202,7 @@ if command -v curl &>/dev/null; then
     [[ "$COMPOSE_URL" == */main/* ]] || info "Usando o docker-compose.client.yml da versão fixada (${COMPOSE_URL#"$CLIENT_RAW_URL"/})."
     TARGET_COMPOSE="$SCRIPT_DIR/${COMPOSE_FILE:-docker-compose.client.yml}"
     if ! cmp -s "$COMPOSE_TMP" "$TARGET_COMPOSE"; then
-      if ! rslave_preflight "$COMPOSE_TMP"; then
+      if ! rslave_preflight "$COMPOSE_TMP" "$SCRIPT_DIR/.env"; then
         rm -f "$COMPOSE_TMP"
         exit 1
       fi
@@ -196,6 +236,36 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
   source "$SCRIPT_DIR/.env"
   set +a
 fi
+
+# ── Chave dos segredos do banco interno (Issue #228) ─────────────────────────
+# Sem PGWHO_ENCRYPTION_KEY, as senhas das instâncias, os segredos dos canais e
+# as chaves de IA ficam cifrados com uma semente que está no código: qualquer
+# cópia do banco os abre. Gera a chave uma vez e nunca troca uma que exista —
+# trocar deixaria ilegível tudo o que foi gravado com a anterior. O backend
+# regrava os segredos com a chave nova no boot.
+if [[ -z "${PGWHO_ENCRYPTION_KEY:-}" && -f "$SCRIPT_DIR/.env" ]]; then
+  if [[ -w "$SCRIPT_DIR/.env" ]] && command -v openssl &>/dev/null; then
+    NEW_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+    if grep -q '^PGWHO_ENCRYPTION_KEY=' "$SCRIPT_DIR/.env"; then
+      # A linha existe mas está vazia (o -z acima garante): preenche. awk + cat
+      # em vez de `sed -i`: funciona com o sed do macOS e mantém o arquivo (dono,
+      # permissão 600, bind mount).
+      awk -v k="$NEW_ENCRYPTION_KEY" '/^PGWHO_ENCRYPTION_KEY=/{print "PGWHO_ENCRYPTION_KEY=" k; next} {print}' \
+        "$SCRIPT_DIR/.env" > "$SCRIPT_DIR/.env.tmp.$$" && cat "$SCRIPT_DIR/.env.tmp.$$" > "$SCRIPT_DIR/.env"
+      rm -f "$SCRIPT_DIR/.env.tmp.$$"
+    else
+      printf '\n# Chave dos segredos do banco interno: guarde junto com o backup do banco.\nPGWHO_ENCRYPTION_KEY=%s\n' \
+        "$NEW_ENCRYPTION_KEY" >> "$SCRIPT_DIR/.env"
+    fi
+    export PGWHO_ENCRYPTION_KEY="$NEW_ENCRYPTION_KEY"
+    info "Chave dos segredos do banco interno gerada (PGWHO_ENCRYPTION_KEY no .env) ✓"
+    warn "Guarde o .env junto com o backup do banco: sem a chave, um banco restaurado não abre as senhas das instâncias."
+  else
+    warn "PGWHO_ENCRYPTION_KEY não definida e o .env não pode ser alterado daqui (atualização pela tela)."
+    warn "Rode ./update.sh no servidor uma vez para gerar a chave dos segredos do banco interno."
+  fi
+fi
+# ── fim: chave dos segredos ──────────────────────────────────────────────────
 
 # ── Configuração ─────────────────────────────────────────────────────────────
 
@@ -300,6 +370,43 @@ if [[ -z "${DATA_VOLUME_NAME:-}" ]] && docker volume inspect pgwatchai_timescale
     info "Volume legado (pgwatchai_timescaledb_data) detectado e preservado no compose."
   fi
 fi
+
+# ── Identidade da instalação para a licença v2 (Issue #234) ───────────────────
+# PGWHO_INSTALLATION_ID vive no .env: reinstalar com o mesmo .env mantém a
+# ativação. Numa instalação que ainda não tem a variável, adota o id que o
+# backend já guardou no banco (atualizações feitas pela tela não escrevem no
+# .env); só sem nenhum gera um novo. Nunca troca um id que já exista.
+if [[ -z "${PGWHO_INSTALLATION_ID:-}" && -f "$SCRIPT_DIR/.env" ]]; then
+  if [[ -w "$SCRIPT_DIR/.env" ]]; then
+    NEW_INSTALLATION_ID=""
+    for db_container in pgwho_db pgwatch_db; do
+      NEW_INSTALLATION_ID=$(docker exec "$db_container" psql -U "${DB_USER:-pgwho}" -d "${DB_NAME:-pgwho}" -tAc \
+        "SELECT value FROM system_settings WHERE key = 'installation_id'" 2>/dev/null | tr -d '[:space:]' || true)
+      [[ -n "$NEW_INSTALLATION_ID" ]] && break
+    done
+    if [[ ! "$NEW_INSTALLATION_ID" =~ ^[A-Za-z0-9-]{1,64}$ ]]; then
+      if command -v openssl &>/dev/null; then
+        NEW_INSTALLATION_ID="inst-$(openssl rand -hex 16)"
+      else
+        NEW_INSTALLATION_ID="inst-$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+      fi
+    fi
+    if grep -q '^PGWHO_INSTALLATION_ID=' "$SCRIPT_DIR/.env"; then
+      awk -v k="$NEW_INSTALLATION_ID" '/^PGWHO_INSTALLATION_ID=/{print "PGWHO_INSTALLATION_ID=" k; next} {print}' \
+        "$SCRIPT_DIR/.env" > "$SCRIPT_DIR/.env.tmp.$$" && cat "$SCRIPT_DIR/.env.tmp.$$" > "$SCRIPT_DIR/.env"
+      rm -f "$SCRIPT_DIR/.env.tmp.$$"
+    else
+      printf '\n# Identidade desta instalação para a licença: mantenha ao reinstalar.\nPGWHO_INSTALLATION_ID=%s\n' \
+        "$NEW_INSTALLATION_ID" >> "$SCRIPT_DIR/.env"
+    fi
+    export PGWHO_INSTALLATION_ID="$NEW_INSTALLATION_ID"
+    info "Identidade da instalação gravada no .env (PGWHO_INSTALLATION_ID) ✓"
+  else
+    warn "PGWHO_INSTALLATION_ID não definida e o .env não pode ser alterado daqui (atualização pela tela)."
+    warn "O backend usa o id guardado no banco; rode ./update.sh no servidor uma vez para gravá-lo no .env."
+  fi
+fi
+# ── fim: identidade da instalação ────────────────────────────────────────────
 
 # ── Espaço em disco ───────────────────────────────────────────────────────────
 # As imagens novas (~2,5 GB) são baixadas antes das antigas saírem. Sem espaço,

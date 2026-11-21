@@ -103,11 +103,18 @@ if ! docker info &>/dev/null; then
 fi
 info "docker daemon ✓"
 
+# Docker Desktop (Windows/WSL, macOS): o daemon roda numa VM própria. A raiz
+# dela não aceita a montagem rslave; o update.sh grava
+# PGWHO_HOST_ROOT_MOUNT_OPTS=ro no .env e a checagem abaixo não se aplica
+# (no WSL o mountinfo do shell é o da distro, não o da VM do Docker). Issue #248.
+DOCKER_OS=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)
+[[ "$DOCKER_OS" == *"Docker Desktop"* ]] && info "Docker Desktop ✓"
+
 # A raiz (/) do servidor precisa ser montagem compartilhada: o backend monta o
 # / do servidor com propagação rslave (System Health) e, sem isso, não sobe.
 # Systemd já deixa assim; sem systemd, falta um comando antes de instalar.
 MOUNTINFO="${PGWHO_MOUNTINFO:-/proc/self/mountinfo}"   # substituível só nos testes
-if [[ -r "$MOUNTINFO" ]] && \
+if [[ "${DOCKER_OS:-}" != *"Docker Desktop"* && -r "$MOUNTINFO" ]] && \
    ! awk '$5 == "/" { if ($0 ~ / shared:[0-9]+/) ok = 1 } END { exit ok ? 0 : 1 }' "$MOUNTINFO"; then
   error "A raiz (/) do servidor não é uma montagem compartilhada: o backend do pgwho não subiria."
   error "Rode como root:  mount --make-rshared /"
@@ -119,6 +126,19 @@ info "montagem da raiz compartilhada ✓"
 # ── Diretório de instalação ───────────────────────────────────────────────────
 
 section "Preparando diretório"
+
+# WSL: o /mnt/c, /mnt/d... é o disco do Windows. Lá o `chmod 600 .env` não tem
+# efeito (senha e tokens ficariam legíveis) e o updater monta .env, update.sh e
+# o compose através da ponte Windows↔Linux. Quem abre o WSL pelo cmd cai em
+# /mnt/c/WINDOWS/system32 e instalaria ali. Issue #248.
+PROC_VERSION="${PGWHO_PROC_VERSION:-/proc/version}"   # substituível só nos testes
+if [[ "$INSTALL_DIR" == /mnt/[a-zA-Z]/* || "$INSTALL_DIR" == /mnt/[a-zA-Z] ]] && \
+   grep -qi microsoft "$PROC_VERSION" 2>/dev/null; then
+  error "O diretório de instalação está no disco do Windows: $INSTALL_DIR"
+  error "Instale dentro do WSL, por exemplo:"
+  error "  mkdir -p ~/pgwho && cd ~/pgwho && curl -fsSL $BASE_URL/install.sh | bash"
+  exit 1
+fi
 
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
@@ -192,6 +212,8 @@ else
   # Valores gerados automaticamente
   DB_PASSWORD_GEN=$(openssl rand -hex 16)
   SECRET_KEY_GEN=$(openssl rand -hex 32)
+  ENCRYPTION_KEY_GEN=$(openssl rand -base64 32 | tr '+/' '-_')   # chave Fernet (Issue #228)
+  INSTALLATION_ID_GEN="inst-$(openssl rand -hex 16)"           # identidade da instalação (Issue #234)
 
   echo ""
   echo -e "  Pressione ${CYAN}Enter${RESET} para aceitar o valor padrão indicado em ${CYAN}[colchetes]${RESET}."
@@ -314,6 +336,11 @@ DB_PASSWORD=${DB_PASSWORD_GEN}
 
 # ── Segurança ─────────────────────────────────────────────────────────────────
 SECRET_KEY=${SECRET_KEY_GEN}
+# Cifra as senhas das instâncias no banco interno. Guarde junto com o backup do
+# banco e nunca troque: sem ela, as senhas gravadas não abrem.
+PGWHO_ENCRYPTION_KEY=${ENCRYPTION_KEY_GEN}
+# Identidade desta instalação para a licença: mantenha ao reinstalar.
+PGWHO_INSTALLATION_ID=${INSTALLATION_ID_GEN}
 
 # ── Rede ──────────────────────────────────────────────────────────────────────
 FRONTEND_PORT=${FRONTEND_PORT}
@@ -348,7 +375,13 @@ SKIP_SELF_UPDATE=1 bash update.sh
 section "Instalação concluída"
 
 PORTA=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d= -f2 || echo "80")
-IP=$(hostname -I | awk '{print $1}')
+# Docker Desktop publica as portas no localhost do Windows/Mac; o IP da
+# distro WSL ou da VM não é o endereço de acesso.
+if [[ "${DOCKER_OS:-}" == *"Docker Desktop"* ]]; then
+  IP=localhost
+else
+  IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
 
 echo ""
 echo -e "  ${GREEN}✅ pgwho instalado com sucesso!${RESET}"
