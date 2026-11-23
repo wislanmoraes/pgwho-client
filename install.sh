@@ -214,6 +214,9 @@ else
   SECRET_KEY_GEN=$(openssl rand -hex 32)
   ENCRYPTION_KEY_GEN=$(openssl rand -base64 32 | tr '+/' '-_')   # chave Fernet (Issue #228)
   INSTALLATION_ID_GEN="inst-$(openssl rand -hex 16)"           # identidade da instalação (Issue #234)
+  # Senha inicial do admin (Issue #264): nunca admin/admin. Mostrada só aqui no
+  # terminal; o primeiro login exige trocar.
+  ADMIN_PASSWORD_GEN=$(openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-16)
 
   echo ""
   echo -e "  Pressione ${CYAN}Enter${RESET} para aceitar o valor padrão indicado em ${CYAN}[colchetes]${RESET}."
@@ -222,8 +225,10 @@ else
   echo -e "  ${DIM}(para instalar em outro local: cd /outro/diretorio && curl ... | bash)${RESET}"
   echo ""
 
-  # ── Chave de Ativação pgwho (valida via site e obtém token GHCR) ──────────
-  LICENSE_API_URL="${PGWHO_LICENSE_API:-https://pgwho.com/crm/api.php?action=validate_license}"
+  # ── Token de acesso às imagens (GHCR) ──────────────────────────────────────
+  # As imagens ainda são privadas (#239): o token vem junto com a licença. A
+  # licença em si é ativada depois, na tela (Configurações › Licença), com o
+  # código PGW-... — o instalador não fala com o servidor de licenças.
 
   # O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
   ghcr_token_works() {
@@ -233,65 +238,28 @@ else
     [[ "$code" == "200" ]]
   }
 
-  LICENSE_KEY_INPUT=""
   GHCR_TOKEN_INPUT=""
   GHCR_USER_RESOLVED="wislanmoraes"
 
-  echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Chave de Ativação pgwho (enviada por e-mail / Portal CRM)"
-  echo -e "  Formato: ${CYAN}TMA-XXXX-XXXX-...${RESET}"
+  echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Token de acesso às imagens (enviado junto com a licença)"
+  echo -e "  Formato: ${CYAN}ghp_...${RESET} ou ${CYAN}github_pat_...${RESET}"
   echo ""
   while true; do
-    read -rp "  LICENSE_KEY: " RAW_KEY_INPUT </dev/tty
-    RAW_KEY_INPUT="$(echo "$RAW_KEY_INPUT" | tr -d '[:space:]')"
-    if [[ -z "$RAW_KEY_INPUT" ]]; then
-      echo -e "  ${RED}Chave obrigatória.${RESET} Informe sua Chave de Ativação para validar e liberar o download."
+    if ! read -rp "  GHCR_TOKEN: " RAW_TOKEN_INPUT </dev/tty; then
+      error "Sem token de acesso às imagens: instalação interrompida."
+      exit 1
+    fi
+    RAW_TOKEN_INPUT="$(echo "$RAW_TOKEN_INPUT" | tr -d '[:space:]')"
+    if [[ -z "$RAW_TOKEN_INPUT" ]]; then
+      echo -e "  ${RED}Token obrigatório.${RESET} Ele libera o download das imagens do pgwho."
       continue
     fi
-
-    # Suporte legado caso seja informado um PAT ghp_ diretamente
-    if [[ "$RAW_KEY_INPUT" == ghp_* ]] || [[ "$RAW_KEY_INPUT" == github_pat_* ]]; then
-      GHCR_TOKEN_INPUT="$RAW_KEY_INPUT"
-      info "Token GHCR direto informado ✓"
-      break
-    fi
-
-    info "Validando Chave de Ativação em pgwho.com..."
-    VALIDATION_JSON=$(curl -fsSL -X POST "$LICENSE_API_URL" \
-      -H "Content-Type: application/json" \
-      -d "{\"access_key\":\"${RAW_KEY_INPUT}\"}" 2>/dev/null || true)
-
-    if [[ -z "$VALIDATION_JSON" ]]; then
-      error "Não foi possível contatar o servidor de licenças (${LICENSE_API_URL})."
+    if ! ghcr_token_works "$GHCR_USER_RESOLVED" "$RAW_TOKEN_INPUT"; then
+      error "O GHCR não aceitou este token (recusado ou GHCR inacessível). Confira o token recebido com a licença."
       continue
     fi
-
-    IS_VALID=$(echo "$VALIDATION_JSON" | grep -oE '"valid"\s*:\s*(true|false)' | head -1 | grep -oE '(true|false)' || echo "false")
-    if [[ "$IS_VALID" != "true" ]]; then
-      ERR_MSG=$(echo "$VALIDATION_JSON" | sed -n 's/.*"message"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-      error "Chave inválida ou expirada: ${ERR_MSG:-Verifique sua chave no Portal CRM.}"
-      continue
-    fi
-
-    EXTRACTED_TOKEN=$(echo "$VALIDATION_JSON" | sed -n 's/.*"github_token"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-    EXTRACTED_USER=$(echo "$VALIDATION_JSON" | sed -n 's/.*"ghcr_user"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-    EXTRACTED_EXP=$(echo "$VALIDATION_JSON" | sed -n 's/.*"expires_at"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-
-    if [[ -z "$EXTRACTED_TOKEN" ]]; then
-      error "Licença válida, porém o token de pacotes não pôde ser obtido. Contate o suporte pgwho."
-      continue
-    fi
-
-    if ! ghcr_token_works "${EXTRACTED_USER:-wislanmoraes}" "$EXTRACTED_TOKEN"; then
-      # A chave é válida: guarda para o .env mesmo que o token venha de outro lugar.
-      LICENSE_KEY_INPUT="$RAW_KEY_INPUT"
-      error "Licença válida, porém o token de pacotes não foi aceito pelo GHCR (recusado ou GHCR inacessível). Informe um token do GitHub (ghp_...) com read:packages ou contate o suporte pgwho."
-      continue
-    fi
-
-    LICENSE_KEY_INPUT="$RAW_KEY_INPUT"
-    GHCR_TOKEN_INPUT="$EXTRACTED_TOKEN"
-    GHCR_USER_RESOLVED="${EXTRACTED_USER:-wislanmoraes}"
-    info "Licença validada com sucesso! (Válida até: ${EXTRACTED_EXP:-vigente}) ✓"
+    GHCR_TOKEN_INPUT="$RAW_TOKEN_INPUT"
+    info "Token de acesso às imagens aceito ✓"
     break
   done
   echo ""
@@ -323,8 +291,7 @@ else
   echo -e "  ${DIM}DB_PASSWORD     = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}SECRET_KEY      = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}ANTHROPIC_API_KEY = ${ANTHROPIC_API_KEY:-não configurado}${RESET}"
-  [[ -n "$LICENSE_KEY_INPUT" ]] && echo -e "  ${DIM}LICENSE_KEY     = ${LICENSE_KEY_INPUT:0:13}…${RESET}"
-  echo -e "  ${DIM}GHCR_TOKEN      = (sincronizado via licença)${RESET}"
+  echo -e "  ${DIM}GHCR_TOKEN      = ${GHCR_TOKEN_INPUT:0:8}…${RESET}"
   echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
   echo ""
 
@@ -341,6 +308,8 @@ SECRET_KEY=${SECRET_KEY_GEN}
 PGWHO_ENCRYPTION_KEY=${ENCRYPTION_KEY_GEN}
 # Identidade desta instalação para a licença: mantenha ao reinstalar.
 PGWHO_INSTALLATION_ID=${INSTALLATION_ID_GEN}
+# Senha inicial do admin: usada só no primeiro boot; o primeiro login exige trocar.
+PGWHO_ADMIN_PASSWORD=${ADMIN_PASSWORD_GEN}
 
 # ── Rede ──────────────────────────────────────────────────────────────────────
 FRONTEND_PORT=${FRONTEND_PORT}
@@ -354,8 +323,7 @@ COLLECTOR_INTERVAL_SECONDS=60
 ACTIVITY_SAMPLE_INTERVAL_SECONDS=5
 ALERT_EVALUATION_INTERVAL_SECONDS=60
 
-# ── Licenciamento & Atualização ───────────────────────────────────────────────
-LICENSE_KEY=${LICENSE_KEY_INPUT}
+# ── Atualização (a licença é ativada na tela, com o código PGW-...) ──────────
 GHCR_TOKEN=${GHCR_TOKEN_INPUT}
 GHCR_USER=${GHCR_USER_RESOLVED}
 EOF
@@ -387,7 +355,14 @@ echo ""
 echo -e "  ${GREEN}✅ pgwho instalado com sucesso!${RESET}"
 echo ""
 echo -e "  Acesse:       ${CYAN}http://${IP}:${PORTA}${RESET}"
-echo -e "  Login padrão: ${CYAN}admin / admin${RESET}  ← troque a senha após o primeiro acesso"
+INITIAL_PW=$(grep -E '^PGWHO_ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2- || true)
+if [[ -n "$INITIAL_PW" ]]; then
+  echo -e "  Login:        ${CYAN}admin / ${INITIAL_PW}${RESET}  ← senha inicial; o primeiro acesso pede uma nova"
+else
+  echo -e "  Login:        ${CYAN}admin${RESET} com a senha que você já usava"
+fi
+echo ""
+echo -e "  Licença:      ${CYAN}Configurações › Licença${RESET} — cole o código de ativação (PGW-...)"
 echo ""
 echo -e "  Arquivos em:  ${CYAN}${INSTALL_DIR}${RESET}"
 echo ""

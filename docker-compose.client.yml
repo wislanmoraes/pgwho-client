@@ -134,6 +134,9 @@ services:
       DATABASE_URL:      postgresql+asyncpg://${DB_USER:-pgwho}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME:-pgwho}
       DATABASE_URL_SYNC: postgresql://${DB_USER:-pgwho}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME:-pgwho}
       SECRET_KEY:        ${SECRET_KEY:?SECRET_KEY obrigatório}
+      # Senha inicial do admin (#264): gerada pelo install.sh, usada só no
+      # primeiro boot; a troca é exigida no primeiro login.
+      PGWHO_ADMIN_PASSWORD: ${PGWHO_ADMIN_PASSWORD:-}
       # Cifra dos segredos do banco interno (Issue #228): gerada pelo install.sh/update.sh.
       PGWHO_ENCRYPTION_KEY: ${PGWHO_ENCRYPTION_KEY:-}
       # Licença v2 (#234): identidade da instalação, gerada pelo install.sh/update.sh.

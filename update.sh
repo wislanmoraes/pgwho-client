@@ -285,61 +285,6 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
   exit 1
 fi
 
-# ── Validação da Chave de Ativação via site (sincroniza token do GitHub) ─────
-
-LICENSE_API_URL="${PGWHO_LICENSE_API:-https://pgwho.com/crm/api.php?action=validate_license}"
-
-# O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
-ghcr_token_works() {
-  local user="$1" token="$2" code
-  code=$(curl -s -o /dev/null -w "%{http_code}" -u "${user}:${token}" \
-    "https://ghcr.io/token?scope=repository:${user}/pgwho-backend:pull&service=ghcr.io" 2>/dev/null || true)
-  [[ "$code" == "200" ]]
-}
-
-if [[ -n "${LICENSE_KEY:-}" ]] && command -v curl &>/dev/null; then
-  info "Validando Chave de Ativação no site pgwho.com..."
-  VALIDATION_JSON=$(curl -fsSL -X POST "$LICENSE_API_URL" \
-    -H "Content-Type: application/json" \
-    -d "{\"access_key\":\"${LICENSE_KEY}\"}" 2>/dev/null || true)
-
-  if [[ -n "$VALIDATION_JSON" ]]; then
-    IS_VALID=$(echo "$VALIDATION_JSON" | grep -oE '"valid"\s*:\s*(true|false)' | head -1 | grep -oE '(true|false)' || echo "false")
-    if [[ "$IS_VALID" != "true" ]]; then
-      ERR_MSG=$(echo "$VALIDATION_JSON" | sed -n 's/.*"message"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-      error "Sua Chave de Ativação está expirada ou inválida: ${ERR_MSG:-Renove no Portal do Cliente (https://pgwho.com/crm/portal.php).}"
-      exit 1
-    fi
-
-    NEW_GHCR_TOKEN=$(echo "$VALIDATION_JSON" | sed -n 's/.*"github_token"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-    NEW_GHCR_USER=$(echo "$VALIDATION_JSON" | sed -n 's/.*"ghcr_user"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
-
-    if [[ -n "$NEW_GHCR_TOKEN" && "$NEW_GHCR_TOKEN" == "${GHCR_TOKEN:-}" ]]; then
-      info "Chave validada ✓ (credenciais de pacote já atualizadas)"
-    elif [[ -n "$NEW_GHCR_TOKEN" ]]; then
-      NEW_GHCR_USER="${NEW_GHCR_USER:-$GHCR_USER}"
-      # Só substitui o token do .env se o novo funcionar: um token revogado no
-      # servidor de licenças não pode apagar um token local que ainda funciona.
-      if ghcr_token_works "$NEW_GHCR_USER" "$NEW_GHCR_TOKEN"; then
-        GHCR_TOKEN="$NEW_GHCR_TOKEN"
-        GHCR_USER="$NEW_GHCR_USER"
-        if [[ -w "$SCRIPT_DIR/.env" ]]; then
-          if grep -q '^GHCR_TOKEN=' "$SCRIPT_DIR/.env"; then
-            sed -i "s|^GHCR_TOKEN=.*|GHCR_TOKEN=${GHCR_TOKEN}|" "$SCRIPT_DIR/.env" 2>/dev/null || true
-          else
-            echo "GHCR_TOKEN=${GHCR_TOKEN}" >> "$SCRIPT_DIR/.env"
-          fi
-        fi
-        info "Chave validada e credenciais de pacote sincronizadas ✓"
-      else
-        warn "O token de pacotes do servidor de licenças não foi aceito pelo GHCR (recusado ou GHCR inacessível) — mantendo o token atual do .env."
-      fi
-    fi
-  else
-    warn "Não foi possível contatar o servidor de licenças — utilizando credenciais em cache."
-  fi
-fi
-
 # ── Login no registry ─────────────────────────────────────────────────────────
 
 if [[ -n "${GHCR_TOKEN:-}" ]]; then
