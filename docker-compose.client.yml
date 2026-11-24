@@ -147,9 +147,6 @@ services:
       ALERT_EVALUATION_INTERVAL_SECONDS: ${ALERT_EVALUATION_INTERVAL_SECONDS:-60}
       WATCHSHELL_IMAGE: ghcr.io/wislanmoraes/pgwho-watchshell:${IMAGE_TAG:-latest}
       GHCR_USER:  ${GHCR_USER:-wislanmoraes}
-      # Transição da #239: só usado se alguma imagem ainda for privada; o
-      # update.sh tira o token do .env quando todas são públicas.
-      GHCR_TOKEN: ${GHCR_TOKEN:-}
       # Log do sistema operacional (syslog do servidor) no System Health. Desligado
       # por padrão: traz mensagens de todos os serviços da máquina, não só do pgwho.
       PGWHO_HOST_LOGS: ${PGWHO_HOST_LOGS:-false}
@@ -162,7 +159,7 @@ services:
       # inspeciona o PRÓPRIO container via socket e delega qualquer apply/
       # rollback pro sidecar `updater` via HTTP (http://updater:8080/...).
       # O antigo `.:/host_deploy:ro` montava o diretório INTEIRO — incluindo
-      # o .env com DB_PASSWORD/SECRET_KEY/GHCR_TOKEN em texto puro — sem
+      # o .env com DB_PASSWORD/SECRET_KEY em texto puro — sem
       # necessidade nenhuma. Removido; só o socket continua preciso.
       - /var/run/docker.sock:/var/run/docker.sock  # necessário para WatchShell / terminal
       # System Health (Issue #158): CPU, memória, discos, I/O, rede e processos
@@ -251,7 +248,6 @@ services:
       # recriar o próprio updater via um container auxiliar (ver update.sh
       # para o comentário completo sobre por que isso importa).
       HOST_DEPLOY_DIR: ${PWD}
-      GHCR_TOKEN: ${GHCR_TOKEN:-}
       GHCR_USER:  ${GHCR_USER:-wislanmoraes}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -309,7 +305,7 @@ services:
     container_name: pgwho_https
     profiles:
       - https
-    command: ["caddy", "reverse-proxy", "--from", "${PGWHO_DOMAIN:-}", "--to", "frontend:80"]
+    command: ["caddy", "reverse-proxy", "--from", "${PGWHO_DOMAIN:-}", "--to", "frontend:80", "--internal-certs=${PGWHO_TLS_INTERNAL:-false}"]
     ports:
       - "80:80"
       - "443:443"

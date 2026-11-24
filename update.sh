@@ -9,7 +9,6 @@
 #    curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/update.sh | bash
 #
 #  Variáveis de ambiente:
-#    GHCR_TOKEN       só enquanto alguma imagem for privada (#239: são públicas)
 #    GHCR_USER        Usuário GitHub (padrão: wislanmoraes)
 #    COMPOSE_FILE     Arquivo compose (padrão: docker-compose.client.yml)
 #    HOST_DEPLOY_DIR  Caminho REAL no host do diretório de deploy (setado
@@ -285,28 +284,8 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
 fi
 
 # ── Acesso às imagens (#239) ─────────────────────────────────────────────────
-# As imagens do pgwho são públicas: o download não precisa de login. O
-# GHCR_TOKEN só é usado enquanto alguma imagem ainda for privada; com todas
-# públicas, ele sai do .env (o token distribuído é revogado depois).
-GHCR_IMAGES="pgwho-db pgwho-backend pgwho-frontend pgwho-updater pgwho-watchshell"
-
-# Todas as imagens baixam sem credencial? (token anônimo + manifesto da tag)
-ghcr_images_public() {
-  command -v curl &>/dev/null || return 1
-  local img repo tok code
-  for img in $GHCR_IMAGES; do
-    repo="${GHCR_USER}/${img}"
-    tok=$(curl -fsS --max-time 10 \
-      "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" 2>/dev/null \
-      | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
-    [[ -n "$tok" ]] || return 1
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -I \
-      -H "Authorization: Bearer ${tok}" \
-      -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
-      "https://ghcr.io/v2/${repo}/manifests/${IMAGE_TAG:-latest}" 2>/dev/null || true)
-    [[ "$code" == "200" ]] || return 1
-  done
-}
+# As imagens do pgwho são públicas e os tokens de pacotes foram revogados: o
+# download não usa login. Um GHCR_TOKEN que tenha ficado no .env sai dele.
 
 # Tira GHCR_TOKEN do .env sem trocar o arquivo (cat > mantém dono, permissão e
 # o inode do bind mount do updater). Dentro do updater o .env é :ro — fica para
@@ -325,18 +304,8 @@ drop_ghcr_token_from_env() {
   info "Token de acesso às imagens removido do .env (não é mais necessário) ✓"
 }
 
-IMAGES_PUBLIC=0
-if ghcr_images_public; then
-  IMAGES_PUBLIC=1
-  info "Imagens públicas no $REGISTRY: download sem login ✓"
-  drop_ghcr_token_from_env
-  unset GHCR_TOKEN
-elif [[ -n "${GHCR_TOKEN:-}" ]]; then
-  info "Fazendo login no $REGISTRY..."
-  echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USER" --password-stdin
-else
-  warn "Imagens ainda privadas no $REGISTRY e sem GHCR_TOKEN — assumindo login já feito."
-fi
+drop_ghcr_token_from_env
+unset GHCR_TOKEN
 
 # ── Preservação automática de volume (migração pgwatchai -> pgwho) ────────────
 if [[ -z "${DATA_VOLUME_NAME:-}" ]] && docker volume inspect pgwatchai_timescaledb_data >/dev/null 2>&1; then
@@ -436,14 +405,12 @@ pull_images() {
     && docker compose -f "$COMPOSE_FILE" --profile tools pull watchshell  # profile 'tools'
 }
 if ! pull_images; then
-  # Imagens públicas e o pull falhou: o Docker mandou a credencial guardada do
-  # ghcr.io (o token revogado, #239) e o GHCR recusou. Ela não serve mais para
-  # nada: sai dela e tenta sem login.
-  if [[ "$IMAGES_PUBLIC" == 1 ]]; then
-    warn "O $REGISTRY recusou a credencial guardada neste servidor; tentando sem login."
-    docker logout "$REGISTRY" >/dev/null 2>&1 || true
-    pull_images
-  else
+  # O Docker pode ter mandado uma credencial antiga do ghcr.io (token revogado,
+  # #239), que o GHCR recusa até para imagem pública. Ela não serve para nada:
+  # sai dela e tenta de novo sem login.
+  warn "Falha ao baixar as imagens; tentando de novo sem a credencial guardada do $REGISTRY."
+  docker logout "$REGISTRY" >/dev/null 2>&1 || true
+  if ! pull_images; then
     error "Não foi possível baixar as imagens."
     exit 1
   fi

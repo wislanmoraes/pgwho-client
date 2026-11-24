@@ -10,7 +10,7 @@
 #    2. Cria arquivos no diretório atual  (ou $PGWHO_DIR se definido)
 #    3. Baixa docker-compose.client.yml e update.sh
 #    4. Coleta configurações interativamente (com padrões inteligentes)
-#    5. Faz login no GHCR e sobe os containers
+#    5. Baixa as imagens (públicas, sem login) e sobe os containers
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -28,23 +28,26 @@ default() { echo -e "  ${DIM}↳ $*${RESET}"; }
 # Verifica se uma porta já está em uso (Docker ou sistema).
 # Retorna 0 = livre, 1 = em uso.
 # Imprime na stdout quem está usando quando em uso.
-# Imagens do pgwho baixáveis sem credencial (#239)? Mesma checagem do update.sh.
-GHCR_IMAGES="pgwho-db pgwho-backend pgwho-frontend pgwho-updater pgwho-watchshell"
-ghcr_images_public() {
-  command -v curl &>/dev/null || return 1
-  local img repo tok code
-  for img in $GHCR_IMAGES; do
-    repo="${GHCR_USER:-wislanmoraes}/${img}"
-    tok=$(curl -fsS --max-time 10 \
-      "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" 2>/dev/null \
-      | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
-    [[ -n "$tok" ]] || return 1
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -I \
-      -H "Authorization: Bearer ${tok}" \
-      -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
-      "https://ghcr.io/v2/${repo}/manifests/${IMAGE_TAG:-latest}" 2>/dev/null || true)
-    [[ "$code" == "200" ]] || return 1
+# Que certificado um domínio pode ter (HTTPS opcional)?
+#   public     resolve para IP público: Let's Encrypt
+#   local      nome de rede local (.local, .lan, .internal...) ou que só resolve
+#              para IP privado: o Let's Encrypt nunca emite; só certificado
+#              próprio, que o navegador avisa até alguém confiar nele
+#   unresolved ainda não resolve (DNS novo, ou só no hosts de outra máquina)
+domain_kind() {
+  local d="$1" ips ip
+  case "$d" in
+    *.local|*.lan|*.home|*.internal|*.intranet|*.corp|*.localdomain|*.localhost|*.test|*.example|*.invalid|*.home.arpa)
+      echo local; return ;;
+  esac
+  ips=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  [[ -z "$ips" ]] && { echo unresolved; return; }
+  for ip in $ips; do
+    if ! [[ "$ip" =~ ^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; then
+      echo public; return
+    fi
   done
+  echo local
 }
 
 # IPv4 público numa interface do servidor (VPS sem NAT). Sem consulta externa:
@@ -253,50 +256,10 @@ else
   echo -e "  ${DIM}(para instalar em outro local: cd /outro/diretorio && curl ... | bash)${RESET}"
   echo ""
 
-  # ── Token de acesso às imagens (GHCR) ──────────────────────────────────────
-  # As imagens são públicas (#239): sem pergunta. O token só é pedido se alguma
-  # ainda for privada (transição). A licença é ativada depois, na tela
-  # (Configurações › Licença), com o código PGW-... — o instalador não fala com
-  # o servidor de licenças.
-
-  # O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
-  ghcr_token_works() {
-    local user="$1" token="$2" code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -u "${user}:${token}" \
-      "https://ghcr.io/token?scope=repository:${user}/pgwho-backend:pull&service=ghcr.io" 2>/dev/null || true)
-    [[ "$code" == "200" ]]
-  }
-
-  GHCR_TOKEN_INPUT=""
+  # As imagens do pgwho são públicas (#239): o download não usa login nem
+  # token. A licença é ativada depois, na tela (Configurações › Licença), com o
+  # código PGW-... — o instalador não fala com o servidor de licenças.
   GHCR_USER_RESOLVED="wislanmoraes"
-
-  GHCR_PUBLIC=0
-  if GHCR_USER="$GHCR_USER_RESOLVED" ghcr_images_public; then
-    GHCR_PUBLIC=1
-    info "Imagens públicas no GHCR: sem token de acesso ✓"
-  else
-    echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Token de acesso às imagens (enviado junto com a licença)"
-    echo -e "  Formato: ${CYAN}ghp_...${RESET} ou ${CYAN}github_pat_...${RESET}"
-    echo ""
-  fi
-  while [[ "$GHCR_PUBLIC" == 0 ]]; do
-    if ! read -rp "  GHCR_TOKEN: " RAW_TOKEN_INPUT </dev/tty; then
-      error "Sem token de acesso às imagens: instalação interrompida."
-      exit 1
-    fi
-    RAW_TOKEN_INPUT="$(echo "$RAW_TOKEN_INPUT" | tr -d '[:space:]')"
-    if [[ -z "$RAW_TOKEN_INPUT" ]]; then
-      echo -e "  ${RED}Token obrigatório.${RESET} Ele libera o download das imagens do pgwho."
-      continue
-    fi
-    if ! ghcr_token_works "$GHCR_USER_RESOLVED" "$RAW_TOKEN_INPUT"; then
-      error "O GHCR não aceitou este token (recusado ou GHCR inacessível). Confira o token recebido com a licença."
-      continue
-    fi
-    GHCR_TOKEN_INPUT="$RAW_TOKEN_INPUT"
-    info "Token de acesso às imagens aceito ✓"
-    break
-  done
   echo ""
 
   # ── HTTPS (opcional, #269) ───────────────────────────────────────────────
@@ -307,6 +270,7 @@ else
   default "deixe vazio para acessar por http://IP:porta (rede interna ou proxy próprio)"
   default "com domínio: ele precisa apontar para este servidor, e as portas 80 e 443 ficam com o pgwho"
   PGWHO_DOMAIN=""
+  PGWHO_TLS_INTERNAL=false
   while true; do
     read -rp "  PGWHO_DOMAIN [sem HTTPS]: " PGWHO_DOMAIN_INPUT </dev/tty
     PGWHO_DOMAIN_INPUT=$(echo "${PGWHO_DOMAIN_INPUT:-}" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
@@ -317,9 +281,36 @@ else
       error "Informe só o nome, ex.: pgwho.suaempresa.com.br"
       continue
     fi
+    PGWHO_TLS_INTERNAL=false
+    case "$(domain_kind "$PGWHO_DOMAIN_INPUT")" in
+      local)
+        echo ""
+        warn "${PGWHO_DOMAIN_INPUT} é um nome de rede local (ou só aponta para IP privado):"
+        warn "o Let's Encrypt só emite certificado para domínio público que chegue a este"
+        warn "servidor pela internet. Aqui, só um certificado próprio do pgwho: o navegador"
+        warn "mostra \"não seguro\" até você confiar nele (o final da instalação diz como)."
+        read -rp "  Usar HTTPS com o certificado próprio do pgwho? [s/N]: " TLS_OK </dev/tty || TLS_OK=""
+        if [[ ! "${TLS_OK:-}" =~ ^[sS]$ ]]; then
+          echo -e "  ${DIM}Informe outro domínio ou deixe vazio para seguir sem HTTPS.${RESET}"
+          continue
+        fi
+        PGWHO_TLS_INTERNAL=true
+        ;;
+      unresolved)
+        echo ""
+        warn "${PGWHO_DOMAIN_INPUT} ainda não resolve neste servidor. O certificado só sai quando"
+        warn "o DNS apontar para cá e as portas 80 e 443 estiverem acessíveis pela internet."
+        read -rp "  Seguir com este domínio mesmo assim? [s/N]: " TLS_OK </dev/tty || TLS_OK=""
+        [[ "${TLS_OK:-}" =~ ^[sS]$ ]] || continue
+        ;;
+    esac
     if port_in_use 80 >/dev/null && port_in_use 443 >/dev/null; then
       PGWHO_DOMAIN="$PGWHO_DOMAIN_INPUT"
-      info "HTTPS em https://${PGWHO_DOMAIN} ✓"
+      if [[ "$PGWHO_TLS_INTERNAL" == true ]]; then
+        info "HTTPS em https://${PGWHO_DOMAIN} com certificado próprio do pgwho ✓"
+      else
+        info "HTTPS em https://${PGWHO_DOMAIN} ✓"
+      fi
       break
     fi
     port_in_use 80 || true; port_in_use 443 || true
@@ -366,7 +357,6 @@ else
   echo -e "  ${DIM}DB_PASSWORD     = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}SECRET_KEY      = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}ANTHROPIC_API_KEY = ${ANTHROPIC_API_KEY:-não configurado}${RESET}"
-  [[ -n "$GHCR_TOKEN_INPUT" ]] && echo -e "  ${DIM}GHCR_TOKEN      = ${GHCR_TOKEN_INPUT:0:8}…${RESET}"
   echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
   echo ""
 
@@ -376,6 +366,9 @@ else
 # ── HTTPS (Caddy, certificado automático) ─────────────────────────────────────
 COMPOSE_PROFILES=https
 PGWHO_DOMAIN=${PGWHO_DOMAIN}
+# true = certificado próprio do pgwho (domínio de rede local; o navegador avisa
+# até alguém confiar nele). false = Let's Encrypt.
+PGWHO_TLS_INTERNAL=${PGWHO_TLS_INTERNAL}
 FRONTEND_BIND=127.0.0.1:
 PGWHO_PUBLIC_URL=https://${PGWHO_DOMAIN}"
   fi
@@ -410,11 +403,10 @@ ACTIVITY_SAMPLE_INTERVAL_SECONDS=5
 ALERT_EVALUATION_INTERVAL_SECONDS=60
 
 # ── Atualização (a licença é ativada na tela, com o código PGW-...) ──────────
-GHCR_USER=${GHCR_USER_RESOLVED}${GHCR_TOKEN_INPUT:+
-GHCR_TOKEN=${GHCR_TOKEN_INPUT}}
+GHCR_USER=${GHCR_USER_RESOLVED}
 EOF
 
-  chmod 600 .env   # senha e tokens; os containers que o leem rodam como root
+  chmod 600 .env   # senhas e chaves; os containers que o leem rodam como root
   info ".env criado ✓"
 fi
 
@@ -445,7 +437,19 @@ echo -e "  ${GREEN}✅ pgwho instalado com sucesso!${RESET}"
 echo ""
 if [[ -n "$DOMINIO" && ",${PERFIS}," == *",https,"* ]]; then
   echo -e "  Acesse:       ${CYAN}https://${DOMINIO}${RESET}"
-  default "o certificado sai no primeiro acesso; se falhar: docker logs pgwho_https"
+  if [[ "$(grep -E '^PGWHO_TLS_INTERNAL=' .env 2>/dev/null | cut -d= -f2 || true)" == "true" ]]; then
+    echo ""
+    warn "Certificado próprio do pgwho (rede local): o navegador mostra \"não seguro\" até"
+    warn "você confiar nele. Para confiar, exporte o certificado raiz:"
+    echo -e "    ${CYAN}docker compose -f docker-compose.client.yml cp https:/data/caddy/pki/authorities/local/root.crt ./pgwho-ca.crt${RESET}"
+    default "e importe o pgwho-ca.crt como autoridade raiz confiável em cada computador que acessa:"
+    default "Windows: certmgr.msc › Autoridades de Certificação Raiz Confiáveis › Importar"
+    default "macOS: Acesso às Chaves › Sistema, e marque \"Confiar sempre\""
+    default "Linux: copie para /usr/local/share/ca-certificates/ e rode update-ca-certificates"
+    default "O nome ${DOMINIO} também precisa resolver nesses computadores (DNS interno ou arquivo hosts)."
+  else
+    default "o certificado sai no primeiro acesso; se falhar: docker logs pgwho_https"
+  fi
 else
   echo -e "  Acesse:       ${CYAN}http://${IP}:${PORTA}${RESET}"
   # #269: painel sem HTTPS num servidor com IP público = senha e sessão em
