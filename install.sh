@@ -28,6 +28,34 @@ default() { echo -e "  ${DIM}↳ $*${RESET}"; }
 # Verifica se uma porta já está em uso (Docker ou sistema).
 # Retorna 0 = livre, 1 = em uso.
 # Imprime na stdout quem está usando quando em uso.
+# Imagens do pgwho baixáveis sem credencial (#239)? Mesma checagem do update.sh.
+GHCR_IMAGES="pgwho-db pgwho-backend pgwho-frontend pgwho-updater pgwho-watchshell"
+ghcr_images_public() {
+  command -v curl &>/dev/null || return 1
+  local img repo tok code
+  for img in $GHCR_IMAGES; do
+    repo="${GHCR_USER:-wislanmoraes}/${img}"
+    tok=$(curl -fsS --max-time 10 \
+      "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" 2>/dev/null \
+      | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
+    [[ -n "$tok" ]] || return 1
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -I \
+      -H "Authorization: Bearer ${tok}" \
+      -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+      "https://ghcr.io/v2/${repo}/manifests/${IMAGE_TAG:-latest}" 2>/dev/null || true)
+    [[ "$code" == "200" ]] || return 1
+  done
+}
+
+# IPv4 público numa interface do servidor (VPS sem NAT). Sem consulta externa:
+# um servidor atrás de NAT na nuvem não aparece aqui, e o aviso não sai.
+has_public_ipv4() {
+  command -v ip &>/dev/null || return 1
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+    | grep -vE '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+    | grep -q .
+}
+
 port_in_use() {
   local port="$1"
 
@@ -226,9 +254,10 @@ else
   echo ""
 
   # ── Token de acesso às imagens (GHCR) ──────────────────────────────────────
-  # As imagens ainda são privadas (#239): o token vem junto com a licença. A
-  # licença em si é ativada depois, na tela (Configurações › Licença), com o
-  # código PGW-... — o instalador não fala com o servidor de licenças.
+  # As imagens são públicas (#239): sem pergunta. O token só é pedido se alguma
+  # ainda for privada (transição). A licença é ativada depois, na tela
+  # (Configurações › Licença), com o código PGW-... — o instalador não fala com
+  # o servidor de licenças.
 
   # O GHCR aceita este token para baixar as imagens? (HTTP 200 no endpoint de token)
   ghcr_token_works() {
@@ -241,10 +270,16 @@ else
   GHCR_TOKEN_INPUT=""
   GHCR_USER_RESOLVED="wislanmoraes"
 
-  echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Token de acesso às imagens (enviado junto com a licença)"
-  echo -e "  Formato: ${CYAN}ghp_...${RESET} ou ${CYAN}github_pat_...${RESET}"
-  echo ""
-  while true; do
+  GHCR_PUBLIC=0
+  if GHCR_USER="$GHCR_USER_RESOLVED" ghcr_images_public; then
+    GHCR_PUBLIC=1
+    info "Imagens públicas no GHCR: sem token de acesso ✓"
+  else
+    echo -e "  ${YELLOW}[OBRIGATÓRIO]${RESET} Token de acesso às imagens (enviado junto com a licença)"
+    echo -e "  Formato: ${CYAN}ghp_...${RESET} ou ${CYAN}github_pat_...${RESET}"
+    echo ""
+  fi
+  while [[ "$GHCR_PUBLIC" == 0 ]]; do
     if ! read -rp "  GHCR_TOKEN: " RAW_TOKEN_INPUT </dev/tty; then
       error "Sem token de acesso às imagens: instalação interrompida."
       exit 1
@@ -264,12 +299,51 @@ else
   done
   echo ""
 
-  # ── Porta do painel (com verificação de conflito) ────────────────────────
-  echo -e "  ${CYAN}[OPCIONAL]${RESET} Porta do painel web"
-  default "padrão: 80 — verificamos se já está em uso antes de continuar"
+  # ── HTTPS (opcional, #269) ───────────────────────────────────────────────
+  # Sem HTTPS, senha do login, sessão e senhas das instâncias passam em texto
+  # puro pela rede. Com um domínio, o Caddy (serviço `https` do compose) emite
+  # e renova o certificado; o painel em HTTP fica só no próprio servidor.
+  echo -e "  ${CYAN}[OPCIONAL]${RESET} Domínio para acesso com HTTPS (certificado automático)"
+  default "deixe vazio para acessar por http://IP:porta (rede interna ou proxy próprio)"
+  default "com domínio: ele precisa apontar para este servidor, e as portas 80 e 443 ficam com o pgwho"
+  PGWHO_DOMAIN=""
   while true; do
-    read -rp "  FRONTEND_PORT [80]: " FRONTEND_PORT_INPUT </dev/tty
-    FRONTEND_PORT="${FRONTEND_PORT_INPUT:-80}"
+    read -rp "  PGWHO_DOMAIN [sem HTTPS]: " PGWHO_DOMAIN_INPUT </dev/tty
+    PGWHO_DOMAIN_INPUT=$(echo "${PGWHO_DOMAIN_INPUT:-}" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    PGWHO_DOMAIN_INPUT="${PGWHO_DOMAIN_INPUT#https://}"; PGWHO_DOMAIN_INPUT="${PGWHO_DOMAIN_INPUT#http://}"
+    PGWHO_DOMAIN_INPUT="${PGWHO_DOMAIN_INPUT%/}"
+    [[ -z "$PGWHO_DOMAIN_INPUT" ]] && break
+    if ! [[ "$PGWHO_DOMAIN_INPUT" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+      error "Informe só o nome, ex.: pgwho.suaempresa.com.br"
+      continue
+    fi
+    if port_in_use 80 >/dev/null && port_in_use 443 >/dev/null; then
+      PGWHO_DOMAIN="$PGWHO_DOMAIN_INPUT"
+      info "HTTPS em https://${PGWHO_DOMAIN} ✓"
+      break
+    fi
+    port_in_use 80 || true; port_in_use 443 || true
+    echo -e "  ${YELLOW}Libere as portas 80 e 443 ou deixe o domínio vazio.${RESET}"
+  done
+  echo ""
+
+  # ── Porta do painel (com verificação de conflito) ────────────────────────
+  PORT_DEFAULT=80
+  if [[ -n "$PGWHO_DOMAIN" ]]; then
+    PORT_DEFAULT=8080
+    echo -e "  ${CYAN}[OPCIONAL]${RESET} Porta do painel em HTTP, só neste servidor (127.0.0.1)"
+    default "padrão: 8080 — o acesso de fora é pelo HTTPS"
+  else
+    echo -e "  ${CYAN}[OPCIONAL]${RESET} Porta do painel web"
+    default "padrão: 80 — verificamos se já está em uso antes de continuar"
+  fi
+  while true; do
+    read -rp "  FRONTEND_PORT [${PORT_DEFAULT}]: " FRONTEND_PORT_INPUT </dev/tty
+    FRONTEND_PORT="${FRONTEND_PORT_INPUT:-$PORT_DEFAULT}"
+    if [[ -n "$PGWHO_DOMAIN" ]] && [[ "$FRONTEND_PORT" == "80" || "$FRONTEND_PORT" == "443" ]]; then
+      echo -e "  ${YELLOW}As portas 80 e 443 ficam com o HTTPS; escolha outra.${RESET}"
+      continue
+    fi
     if port_in_use "$FRONTEND_PORT"; then
       info "Porta ${FRONTEND_PORT} disponível ✓"
       break
@@ -287,13 +361,24 @@ else
 
   # ── Resumo antes de gravar ────────────────────────────────────────────────
   echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
+  echo -e "  ${DIM}PGWHO_DOMAIN    = ${PGWHO_DOMAIN:-sem HTTPS}${RESET}"
   echo -e "  ${DIM}FRONTEND_PORT   = ${FRONTEND_PORT}${RESET}"
   echo -e "  ${DIM}DB_PASSWORD     = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}SECRET_KEY      = (gerado automaticamente)${RESET}"
   echo -e "  ${DIM}ANTHROPIC_API_KEY = ${ANTHROPIC_API_KEY:-não configurado}${RESET}"
-  echo -e "  ${DIM}GHCR_TOKEN      = ${GHCR_TOKEN_INPUT:0:8}…${RESET}"
+  [[ -n "$GHCR_TOKEN_INPUT" ]] && echo -e "  ${DIM}GHCR_TOKEN      = ${GHCR_TOKEN_INPUT:0:8}…${RESET}"
   echo -e "  ${DIM}─────────────────────────────────────────${RESET}"
   echo ""
+
+  HTTPS_ENV=""
+  if [[ -n "$PGWHO_DOMAIN" ]]; then
+    HTTPS_ENV="
+# ── HTTPS (Caddy, certificado automático) ─────────────────────────────────────
+COMPOSE_PROFILES=https
+PGWHO_DOMAIN=${PGWHO_DOMAIN}
+FRONTEND_BIND=127.0.0.1:
+PGWHO_PUBLIC_URL=https://${PGWHO_DOMAIN}"
+  fi
 
   cat > .env <<EOF
 # ── Banco de dados ────────────────────────────────────────────────────────────
@@ -314,6 +399,7 @@ PGWHO_ADMIN_PASSWORD=${ADMIN_PASSWORD_GEN}
 # ── Rede ──────────────────────────────────────────────────────────────────────
 FRONTEND_PORT=${FRONTEND_PORT}
 IMAGE_TAG=latest
+${HTTPS_ENV}
 
 # ── Integrações de IA (configure depois na UI se preferir) ────────────────────
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -324,8 +410,8 @@ ACTIVITY_SAMPLE_INTERVAL_SECONDS=5
 ALERT_EVALUATION_INTERVAL_SECONDS=60
 
 # ── Atualização (a licença é ativada na tela, com o código PGW-...) ──────────
-GHCR_TOKEN=${GHCR_TOKEN_INPUT}
-GHCR_USER=${GHCR_USER_RESOLVED}
+GHCR_USER=${GHCR_USER_RESOLVED}${GHCR_TOKEN_INPUT:+
+GHCR_TOKEN=${GHCR_TOKEN_INPUT}}
 EOF
 
   chmod 600 .env   # senha e tokens; os containers que o leem rodam como root
@@ -351,10 +437,28 @@ else
   IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 fi
 
+DOMINIO=$(grep -E '^PGWHO_DOMAIN=' .env 2>/dev/null | cut -d= -f2 || true)
+PERFIS=$(grep -E '^COMPOSE_PROFILES=' .env 2>/dev/null | cut -d= -f2 || true)
+
 echo ""
 echo -e "  ${GREEN}✅ pgwho instalado com sucesso!${RESET}"
 echo ""
-echo -e "  Acesse:       ${CYAN}http://${IP}:${PORTA}${RESET}"
+if [[ -n "$DOMINIO" && ",${PERFIS}," == *",https,"* ]]; then
+  echo -e "  Acesse:       ${CYAN}https://${DOMINIO}${RESET}"
+  default "o certificado sai no primeiro acesso; se falhar: docker logs pgwho_https"
+else
+  echo -e "  Acesse:       ${CYAN}http://${IP}:${PORTA}${RESET}"
+  # #269: painel sem HTTPS num servidor com IP público = senha e sessão em
+  # texto puro pela internet. Só um aviso: a decisão (firewall, rede interna, proxy
+  # próprio) é de quem instala.
+  if has_public_ipv4; then
+    echo ""
+    warn "Este servidor tem IP público e o painel está sem HTTPS: a senha do login"
+    warn "e as senhas das instâncias passariam em texto puro pela internet."
+    warn "Feche a porta ${PORTA} no firewall (acesso só pela rede interna) ou"
+    warn "reinstale informando um domínio para HTTPS."
+  fi
+fi
 INITIAL_PW=$(grep -E '^PGWHO_ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2- || true)
 if [[ -n "$INITIAL_PW" ]]; then
   echo -e "  Login:        ${CYAN}admin / ${INITIAL_PW}${RESET}  ← senha inicial; o primeiro acesso pede uma nova"

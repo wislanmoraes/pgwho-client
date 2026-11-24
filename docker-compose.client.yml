@@ -6,8 +6,7 @@
 #    2. Crie um .env com as variáveis listadas abaixo
 #    3. docker compose -f docker-compose.client.yml up -d
 #
-#  Pré-requisito: login no registry
-#    echo $GHCR_TOKEN | docker login ghcr.io -u SEU_USUARIO --password-stdin
+#  As imagens são públicas (#239): não há login no registry.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: pgwho
@@ -148,10 +147,15 @@ services:
       ALERT_EVALUATION_INTERVAL_SECONDS: ${ALERT_EVALUATION_INTERVAL_SECONDS:-60}
       WATCHSHELL_IMAGE: ghcr.io/wislanmoraes/pgwho-watchshell:${IMAGE_TAG:-latest}
       GHCR_USER:  ${GHCR_USER:-wislanmoraes}
+      # Transição da #239: só usado se alguma imagem ainda for privada; o
+      # update.sh tira o token do .env quando todas são públicas.
       GHCR_TOKEN: ${GHCR_TOKEN:-}
       # Log do sistema operacional (syslog do servidor) no System Health. Desligado
       # por padrão: traz mensagens de todos os serviços da máquina, não só do pgwho.
       PGWHO_HOST_LOGS: ${PGWHO_HOST_LOGS:-false}
+      # Base dos links "Abrir no pgwho" das notificações quando o canal não
+      # guardou endereço (o install.sh grava https://<domínio> com HTTPS).
+      PGWHO_PUBLIC_URL: ${PGWHO_PUBLIC_URL:-}
     volumes:
       # Achado numa revisão de segurança: o backend NUNCA lê/escreve nada
       # do diretório de deploy no código real (routers/updates.py) — ele só
@@ -211,7 +215,10 @@ services:
     image: ghcr.io/wislanmoraes/pgwho-frontend:${IMAGE_TAG:-latest}
     container_name: pgwho_frontend
     ports:
-      - "${FRONTEND_PORT:-80}:80"   # única porta exposta ao mundo externo
+      # Sem HTTPS, a única porta exposta. Com HTTPS (serviço `https` abaixo), o
+      # install.sh grava FRONTEND_BIND=127.0.0.1: e o painel em HTTP só responde
+      # no próprio servidor; quem vem de fora entra pelo Caddy.
+      - "${FRONTEND_BIND:-}${FRONTEND_PORT:-80}:80"
     networks:
       - pgwho_internal
     depends_on:
@@ -291,6 +298,36 @@ services:
           memory: 256m
     # Porta 8080 nunca exposta ao host — acessível via /updater/ no Nginx
 
+  # ── HTTPS (opcional, #269) ────────────────────────────────────────────────
+  # Só sobe com COMPOSE_PROFILES=https no .env (o install.sh grava quando se
+  # informa um domínio). O Caddy emite e renova o certificado (Let's Encrypt)
+  # para PGWHO_DOMAIN: o domínio precisa apontar para este servidor e as portas
+  # 80 e 443 precisam estar livres e abertas para a internet.
+  https:
+    <<: *hardening
+    image: caddy:2.10.0-alpine
+    container_name: pgwho_https
+    profiles:
+      - https
+    command: ["caddy", "reverse-proxy", "--from", "${PGWHO_DOMAIN:-}", "--to", "frontend:80"]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data      # certificados: perder obriga a emitir de novo
+      - caddy_config:/config
+    networks:
+      - pgwho_internal
+    depends_on:
+      - frontend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+
   # ── WatchShell (ferramenta interativa — opcional) ─────────────────────────
   watchshell:
     <<: *hardening
@@ -318,3 +355,7 @@ networks:
 volumes:
   timescaledb_data:
     name: ${DATA_VOLUME_NAME:-pgwho_timescaledb_data}
+  caddy_data:
+    name: pgwho_caddy_data
+  caddy_config:
+    name: pgwho_caddy_config
