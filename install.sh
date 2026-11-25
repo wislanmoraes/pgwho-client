@@ -200,8 +200,9 @@ if [[ -n "$EXISTING_CONTAINERS" ]] || docker volume ls --quiet 2>/dev/null | gre
     echo ""
     echo -e "  ${CYAN}[1]${RESET} Atualização normal    — mantém dados históricos de monitoramento"
     echo -e "  ${CYAN}[2]${RESET} Reinstalação limpa    — ${RED}APAGA${RESET} dados de monitoramento e recria do zero"
-    echo -e "       ${DIM}(targets, usuários e alertas configurados são preservados)${RESET}"
+    echo -e "       ${DIM}(inclusive instâncias, usuários e alertas; veja abaixo se só esqueceu a senha)${RESET}"
     echo ""
+    echo -e "  ${DIM}Esqueceu a senha? Não reinstale: docker exec -it pgwho_backend ./reset-password${RESET}"
     echo -e "  ${DIM}Dica: sem prompt, use: curl -fsSL .../install.sh | PGWHO_FRESH=1 bash${RESET}"
     echo ""
     read -rp "  Escolha [1]: " INSTALL_CHOICE </dev/tty
@@ -469,6 +470,7 @@ if [[ -n "$INITIAL_PW" ]]; then
 else
   echo -e "  Login:        ${CYAN}admin${RESET} com a senha que você já usava"
 fi
+echo -e "  Esqueceu a senha? ${CYAN}docker exec -it pgwho_backend ./reset-password${RESET}"
 echo ""
 echo -e "  Licença:      ${CYAN}Configurações › Licença${RESET} — cole o código de ativação (PGW-...)"
 echo ""
