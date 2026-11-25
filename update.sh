@@ -404,17 +404,43 @@ pull_images() {
   docker compose -f "$COMPOSE_FILE" pull \
     && docker compose -f "$COMPOSE_FILE" --profile tools pull watchshell  # profile 'tools'
 }
-if ! pull_images; then
-  # O Docker pode ter mandado uma credencial antiga do ghcr.io (token revogado,
-  # #239), que o GHCR recusa até para imagem pública. Ela não serve para nada:
-  # sai dela e tenta de novo sem login.
-  warn "Falha ao baixar as imagens; tentando de novo sem a credencial guardada do $REGISTRY."
-  docker logout "$REGISTRY" >/dev/null 2>&1 || true
-  if ! pull_images; then
-    error "Não foi possível baixar as imagens."
+# O ghcr.io responde neste momento? (HTTP qualquer em até 10 s; sem resposta =
+# rede, não imagem.) Separa "a rede oscilou" de "a imagem não existe".
+ghcr_reachable() {
+  command -v curl &>/dev/null || return 0
+  curl -s -o /dev/null --max-time 10 "https://${REGISTRY}/v2/" 2>/dev/null
+}
+# Uma oscilação de rede no meio de ~2 GB derrubava a atualização inteira. Tenta
+# até PGWHO_PULL_ATTEMPTS vezes, esperando 1×, 3× e 6× PGWHO_PULL_WAIT_S; as
+# camadas já baixadas ficam no Docker e não são baixadas de novo. Na primeira
+# falha, sai também da credencial guardada do ghcr.io: um token revogado (#239)
+# é recusado até para imagem pública.
+PULL_ATTEMPTS="${PGWHO_PULL_ATTEMPTS:-4}"
+PULL_WAIT_S="${PGWHO_PULL_WAIT_S:-10}"
+pull_attempt=1
+until pull_images; do
+  [[ "$pull_attempt" == 1 ]] && { docker logout "$REGISTRY" >/dev/null 2>&1 || true; }
+  network=0; ghcr_reachable || network=1
+  if (( pull_attempt >= PULL_ATTEMPTS )); then
+    error "Não foi possível baixar as imagens depois de ${pull_attempt} tentativas. Nada foi trocado: a versão atual continua no ar."
+    if [[ "$network" == 1 ]]; then
+      error "O ${REGISTRY} não respondeu deste servidor: o problema é a rede até ele, não a imagem."
+      error "  Teste: curl -sI --max-time 15 https://${REGISTRY}/v2/   (o esperado é HTTP 401 na hora)"
+      error "  Comum: túnel de rede corporativa, proxy ou antivírus inspecionando HTTPS, DNS; no WSL, 'wsl --shutdown' e reabrir o Docker Desktop."
+      error "  Depois rode de novo: as camadas já baixadas não são baixadas outra vez."
+    fi
     exit 1
   fi
-fi
+  case "$pull_attempt" in 1) wait_s=$PULL_WAIT_S ;; 2) wait_s=$((PULL_WAIT_S * 3)) ;; *) wait_s=$((PULL_WAIT_S * 6)) ;; esac
+  if [[ "$network" == 1 ]]; then
+    warn "O ${REGISTRY} não respondeu (rede instável até ele). Nova tentativa em ${wait_s} s ($((pull_attempt + 1)) de ${PULL_ATTEMPTS})."
+  else
+    warn "Falha ao baixar as imagens. Nova tentativa em ${wait_s} s ($((pull_attempt + 1)) de ${PULL_ATTEMPTS}), sem a credencial guardada do ${REGISTRY}."
+  fi
+  sleep "$wait_s"
+  pull_attempt=$((pull_attempt + 1))
+done
+# ── fim: baixar imagens ──
 
 # ── Reiniciar serviços ────────────────────────────────────────────────────────
 

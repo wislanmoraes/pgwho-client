@@ -202,7 +202,7 @@ if [[ -n "$EXISTING_CONTAINERS" ]] || docker volume ls --quiet 2>/dev/null | gre
     echo -e "  ${CYAN}[2]${RESET} Reinstalação limpa    — ${RED}APAGA${RESET} dados de monitoramento e recria do zero"
     echo -e "       ${DIM}(targets, usuários e alertas configurados são preservados)${RESET}"
     echo ""
-    echo -e "  ${DIM}Dica: passe PGWHO_FRESH=1 antes do curl para forçar reinstalação sem prompt.${RESET}"
+    echo -e "  ${DIM}Dica: sem prompt, use: curl -fsSL .../install.sh | PGWHO_FRESH=1 bash${RESET}"
     echo ""
     read -rp "  Escolha [1]: " INSTALL_CHOICE </dev/tty
     INSTALL_CHOICE="${INSTALL_CHOICE:-1}"
