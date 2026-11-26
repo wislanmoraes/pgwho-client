@@ -43,9 +43,9 @@ services:
     # releases mais novas. Resultado: backend trava no lifespan pra
     # SEMPRE (não é transitório) até a imagem ser trocada de volta pra uma
     # versão >= a já registrada. NUNCA reduza esta tag abaixo da mais alta
-    # já publicada aqui — só suba. (main.py roda ALTER EXTENSION UPDATE no
-    # boot, então subir a versão sempre migra os clientes pra frente
-    # sozinho; descer nunca vai funcionar, e trava instalações existentes.)
+    # já publicada aqui — só suba. (O backend roda ALTER EXTENSION UPDATE na
+    # subida, services/ts_extension.py, então subir a versão migra os clientes
+    # pra frente sozinho; descer nunca vai funcionar: a subida para avisando.)
     # TimescaleDB + pg_cron. A versão do TimescaleDB fica em db/Dockerfile
     # (TIMESCALE_TAG) e segue a regra acima: só sobe, nunca desce.
     image: ghcr.io/wislanmoraes/pgwho-db:${IMAGE_TAG:-latest}
