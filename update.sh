@@ -15,6 +15,9 @@
 #                      automaticamente pelo compose via ${PWD} na criação do
 #                      updater) — necessário pra ele recriar a si mesmo.
 #    SKIP_SELF_UPDATE=1  Desativa a auto-atualização deste script
+#    PGWHO_ROLLBACK_DIGEST=sha256:…  Volta backend e frontend à versão desse
+#                      digest da imagem do backend (usado pela tela). O banco,
+#                      o compose, o updater e o WatchShell ficam como estão.
 #
 #  Nota pra instalações de ANTES desta variável existir: a primeira
 #  atualização depois de adotar isso ainda vai pedir um passo manual único
@@ -64,6 +67,13 @@ if [[ "${SKIP_SELF_UPDATE:-0}" != "1" ]] && [[ -t 0 ]] && command -v curl &>/dev
     rm -f "$TEMP"
     warn "Não foi possível verificar atualização do script — continuando com a versão local."
   fi
+fi
+
+# ── Modo de retorno (Issue #221) ─────────────────────────────────────────────
+ROLLBACK_DIGEST="${PGWHO_ROLLBACK_DIGEST:-}"
+if [[ -n "$ROLLBACK_DIGEST" && ! "$ROLLBACK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  error "PGWHO_ROLLBACK_DIGEST inválido: esperado sha256: e 64 dígitos hexadecimais. Nada foi alterado."
+  exit 1
 fi
 
 # ── A raiz do servidor aceita a montagem rslave? ─────────────────────────────
@@ -186,7 +196,8 @@ compose_urls() {
   echo "$CLIENT_RAW_URL/main/docker-compose.client.yml"
 }
 
-if command -v curl &>/dev/null; then
+# No retorno o compose fica o atual: trocá-lo poderia recriar o banco.
+if [[ -z "$ROLLBACK_DIGEST" ]] && command -v curl &>/dev/null; then
   COMPOSE_TMP="$(mktemp)"
   COMPOSE_URL=""
   for url in $(compose_urls); do
@@ -400,7 +411,57 @@ fi
 # ── Baixar novas imagens ──────────────────────────────────────────────────────
 
 info "Baixando novas imagens..."
+# Referência da imagem de um serviço no compose (com o IMAGE_TAG da instalação).
+# `config --images <serviço>` lista também as dependências: filtra pelo nome.
+compose_image_ref() {  # compose_image_ref <serviço> <nome da imagem>
+  docker compose -f "$COMPOSE_FILE" config --images "$1" 2>/dev/null | grep -m1 -E "/$2(:|@|\$)" || true
+}
+image_label() {  # image_label <imagem> <label>
+  docker image inspect --format "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true
+}
+# Retorno: baixa o backend pelo digest e o frontend da mesma versão (label da
+# imagem do backend). Só baixa: quem troca a versão é rollback_retag.
+rollback_pull() {
+  docker pull "$RB_BACKEND" || return 1
+  RB_VERSION=$(image_label "$RB_BACKEND" org.opencontainers.image.version)
+  RB_VERSION="${RB_VERSION#v}"
+  if [[ ! "$RB_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    error "A imagem de destino não informa a versão (X.Y.Z): não dá para voltar o frontend junto. Nada foi alterado."
+    exit 1
+  fi
+  RB_FRONTEND="${RB_FRONTEND_REF%:*}:$RB_VERSION"
+  docker pull "$RB_FRONTEND"
+}
+# As imagens de destino passam a ser as da tag que o compose usa (:latest ou o
+# IMAGE_TAG fixado): vale também no próximo `up`, até a próxima atualização.
+rollback_retag() {
+  local rev_b rev_f
+  rev_b=$(image_label "$RB_BACKEND" org.opencontainers.image.revision)
+  rev_f=$(image_label "$RB_FRONTEND" org.opencontainers.image.revision)
+  if [[ -z "$rev_b" || "$rev_b" != "$rev_f" ]]; then
+    error "Backend e frontend da versão $RB_VERSION não são do mesmo commit. Nada foi alterado."
+    exit 1
+  fi
+  docker tag "$RB_BACKEND" "$RB_BACKEND_REF"
+  docker tag "$RB_FRONTEND" "$RB_FRONTEND_REF"
+}
+if [[ -n "$ROLLBACK_DIGEST" ]]; then
+  RB_BACKEND_REF=$(compose_image_ref backend pgwho-backend)
+  RB_FRONTEND_REF=$(compose_image_ref frontend pgwho-frontend)
+  if [[ -z "$RB_BACKEND_REF" || -z "$RB_FRONTEND_REF" ]]; then
+    error "Não foi possível ler do compose as imagens do backend e do frontend. Nada foi alterado."
+    exit 1
+  fi
+  # O retorno não mexe no banco; sem ele no ar o backend não subiria.
+  if [[ "$(docker inspect --format '{{.State.Status}}' pgwho_db 2>/dev/null || true)" != "running" ]]; then
+    error "O banco interno (pgwho_db) não está no ar. Nada foi alterado."
+    exit 1
+  fi
+  RB_BACKEND="${RB_BACKEND_REF%:*}@$ROLLBACK_DIGEST"
+  info "Voltando para ${ROLLBACK_DIGEST:0:23}…"
+fi
 pull_images() {
+  if [[ -n "$ROLLBACK_DIGEST" ]]; then rollback_pull; return; fi
   docker compose -f "$COMPOSE_FILE" pull \
     && docker compose -f "$COMPOSE_FILE" --profile tools pull watchshell  # profile 'tools'
 }
@@ -440,6 +501,10 @@ until pull_images; do
   sleep "$wait_s"
   pull_attempt=$((pull_attempt + 1))
 done
+if [[ -n "$ROLLBACK_DIGEST" ]]; then
+  rollback_retag
+  info "Versão de destino: $RB_VERSION (backend e frontend)."
+fi
 # ── fim: baixar imagens ──
 
 # ── Reiniciar serviços ────────────────────────────────────────────────────────
@@ -521,13 +586,17 @@ db_will_be_recreated() {
   return 1
 }
 
-info "Removendo containers legados (pgwatch_*), se existirem..."
-for c in pgwatch_backend pgwatch_watchshell pgwatch_db pgwatch_frontend; do
-  stop_and_remove "$c"
-done
-remove_foreign_containers pgwho_backend pgwho_watchshell pgwho_db pgwho_frontend
+if [[ -z "$ROLLBACK_DIGEST" ]]; then
+  info "Removendo containers legados (pgwatch_*), se existirem..."
+  for c in pgwatch_backend pgwatch_watchshell pgwatch_db pgwatch_frontend; do
+    stop_and_remove "$c"
+  done
+  remove_foreign_containers pgwho_backend pgwho_watchshell pgwho_db pgwho_frontend
+fi
 
-if db_will_be_recreated; then
+if [[ -n "$ROLLBACK_DIGEST" ]]; then
+  info "Banco interno: fica como está (um TimescaleDB mais antigo não abriria o banco já atualizado)."
+elif db_will_be_recreated; then
   # Com o banco ainda no ar, um CHECKPOINT grava o que está sujo agora: o
   # checkpoint de desligamento fica quase vazio e cabe folgado no tempo de
   # parada. Se o psql morrer, o checkpoint segue no checkpointer, sem lock.
@@ -538,30 +607,55 @@ else
   info "Banco interno sem mudança de imagem nem de configuração — continua no ar."
 fi
 
+# Log do banco: com o logging_collector ligado, `docker logs` só diz que o log
+# foi redirecionado. Lê o arquivo do volume com a imagem do próprio banco, o que
+# funciona também com o container parado; montagem só de leitura, nada baixado.
+db_log_tail() {  # db_log_tail <linhas>
+  local n="$1" img
+  docker logs --tail "$n" pgwho_db 2>&1 || true
+  img=$(docker inspect --format '{{.Image}}' pgwho_db 2>/dev/null || true)
+  [[ -n "$img" ]] || return 0
+  docker run --rm --pull never --network none --volumes-from pgwho_db:ro --entrypoint sh "$img" -c '
+    cd "${PGDATA:-/var/lib/postgresql/data}/log" 2>/dev/null || exit 0
+    for ext in log json; do
+      f=$(ls -t postgresql-*."$ext" 2>/dev/null | head -1)
+      [ -n "$f" ] && [ -s "$f" ] && { echo "--- $f"; tail -n "$0" "$f" | cut -c1-600; }
+    done; true' "$n" 2>&1 || true
+}
+
 compose_up_db_backend() {
+  # Retorno: --no-deps, só o backend — o compose não chega ao banco.
+  if [[ -n "$ROLLBACK_DIGEST" ]]; then
+    docker compose -f "$COMPOSE_FILE" up -d --no-deps --timeout "$DB_STOP_TIMEOUT" backend
+    return
+  fi
   # --timeout: vale para parar os containers ANTIGOS na recriação (sem ele o
   # compose usa o stop_grace_period gravado no container antigo — 10 s em
   # instalações de antes desse campo).
   docker compose -f "$COMPOSE_FILE" up -d --timeout "$DB_STOP_TIMEOUT" timescaledb backend
 }
 
-info "Subindo banco e backend com as novas imagens (o compose só recria o que mudou)..."
+if [[ -n "$ROLLBACK_DIGEST" ]]; then
+  info "Subindo o backend da versão $RB_VERSION..."
+else
+  info "Subindo banco e backend com as novas imagens (o compose só recria o que mudou)..."
+fi
 # depends_on: timescaledb: condition: service_healthy garante a ordem correta.
 # Se o banco ainda não ficou saudável (recuperação de crash longa), o compose
 # desiste e o backend novo fica criado, mas parado: espera o banco e tenta de novo.
 if ! compose_up_db_backend; then
   warn "O compose não conseguiu subir banco e backend. Últimas linhas do log do banco:"
-  docker logs --tail 30 pgwho_db 2>&1 || true
+  db_log_tail 30
   info "Aguardando o banco interno ficar saudável (até $(( ${PGWHO_DB_WAIT_TRIES:-200} * ${PGWHO_HEALTH_INTERVAL:-3} / 60 )) min)..."
   for i in $(seq 1 "${PGWHO_DB_WAIT_TRIES:-200}"); do
     st=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' pgwho_db 2>/dev/null || echo missing)
     [[ "$st" == "healthy" ]] && break
-    (( i % 10 == 0 )) && echo "  banco: $st ($i/${PGWHO_DB_WAIT_TRIES:-200}) — $(docker logs --tail 1 pgwho_db 2>&1 | tail -1)"
+    (( i % 10 == 0 )) && echo "  banco: $st ($i/${PGWHO_DB_WAIT_TRIES:-200}) — $(db_log_tail 1 | tail -1 | cut -c1-200)"
     sleep "${PGWHO_HEALTH_INTERVAL:-3}"
   done
   if ! compose_up_db_backend; then
     error "Banco e backend não subiram. Últimas linhas do log do banco:"
-    docker logs --tail 60 pgwho_db 2>&1 || true
+    db_log_tail 60
     error "  docker compose -f $COMPOSE_FILE ps"
     exit 1
   fi
@@ -590,12 +684,26 @@ for i in $(seq 1 "$HEALTH_TRIES"); do
 done
 
 if [[ "$BACKEND_OK" != "1" ]]; then
-  error "O backend não respondeu em /health depois da atualização."
+  if [[ -n "$ROLLBACK_DIGEST" ]]; then
+    error "O backend da versão $RB_VERSION não respondeu em /health: o retorno falhou."
+    error "Para voltar à versão de antes, rode ./update.sh no servidor."
+  else
+    error "O backend não respondeu em /health depois da atualização."
+  fi
   error "Últimas linhas do log do backend:"
   docker logs --tail 60 pgwho_backend 2>&1 || true
   error "O frontend e o updater não foram trocados. Confira o log acima e o estado dos containers:"
   error "  docker compose -f $COMPOSE_FILE ps"
   exit 1
+fi
+
+if [[ -n "$ROLLBACK_DIGEST" ]]; then
+  info "Voltando o frontend..."
+  docker compose -f "$COMPOSE_FILE" up -d --no-deps frontend
+  echo ""
+  info "✅ Retorno concluído: backend e frontend na versão $RB_VERSION."
+  info "A próxima atualização volta a instalar a versão configurada (IMAGE_TAG, ou a última)."
+  exit 0
 fi
 
 info "Atualizando frontend..."

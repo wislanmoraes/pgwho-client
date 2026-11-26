@@ -57,7 +57,7 @@ services:
     stop_grace_period: 120s
     # Consulta paralela e índices usam /dev/shm; o padrão do Docker é 64 MB.
     shm_size: ${DB_SHM_SIZE:-512m}
-    # Issue #57/#61: pg_stat_statements + auto_explain (limiar 10ms) no banco
+    # Issue #57/#61: pg_stat_statements + auto_explain (limiar 1s, #322) no banco
     # INTERNO — telemetria do próprio backend, além da que já existe pras
     # instâncias monitoradas. Ver docker-compose.dev.yml (repo privado) pro
     # comentário completo sobre a escolha do limiar de 10ms.
@@ -91,11 +91,24 @@ services:
       "-c", "log_lock_waits=on",
       "-c", "log_temp_files=2048",
       "-c", "pg_stat_statements.track=all",
-      "-c", "auto_explain.log_min_duration=10ms",
+      # Log (#322): plano só de consulta lenta, e sem os parâmetros (podem levar
+      # texto das instâncias monitoradas para o log, fora da retenção).
+      "-c", "auto_explain.log_min_duration=1s",
+      "-c", "auto_explain.log_parameter_max_length=0",
       "-c", "auto_explain.log_analyze=off",
       "-c", "auto_explain.log_format=text",
       "-c", "logging_collector=on",
-      "-c", "log_destination=stderr,jsonlog"
+      "-c", "log_destination=jsonlog",
+      # O backend apaga os mais antigos acima de PGWHO_DB_LOG_MAX_MB
+      # (services/db_log_cleanup.py) e depende deste padrão de nome.
+      "-c", "log_filename=postgresql-%Y-%m-%d_%H%M%S.log",
+      "-c", "log_rotation_size=10MB",
+      "-c", "log_rotation_age=1d",
+      # Uma linha por execução do pg_cron no log; o histórico fica em
+      # cron.job_run_details (o Gravador lê), que continua ligado.
+      "-c", "cron.log_statement=off",
+      # Sem contato externo com a Timescale.
+      "-c", "timescaledb.telemetry_level=off"
     ]
     environment:
       POSTGRES_USER:     ${DB_USER:-pgwho}
@@ -150,6 +163,8 @@ services:
       # Log do sistema operacional (syslog do servidor) no System Health. Desligado
       # por padrão: traz mensagens de todos os serviços da máquina, não só do pgwho.
       PGWHO_HOST_LOGS: ${PGWHO_HOST_LOGS:-false}
+      # Teto, em MB, do log do banco interno (mínimo 50).
+      PGWHO_DB_LOG_MAX_MB: ${PGWHO_DB_LOG_MAX_MB:-200}
       # Base dos links "Abrir no pgwho" das notificações quando o canal não
       # guardou endereço (o install.sh grava https://<domínio> com HTTPS).
       PGWHO_PUBLIC_URL: ${PGWHO_PUBLIC_URL:-}
