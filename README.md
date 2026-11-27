@@ -41,25 +41,25 @@ O que cada edição inclui: [pgwho.com/#planos](https://pgwho.com/#planos).
 
 ## Instalação
 
-**No seu computador** (edição Pessoal, só você usa — macOS, Windows com WSL2 ou Linux):
-
-```bash
-mkdir -p ~/pgwho && cd ~/pgwho
-curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/install.sh | bash -s -- --estacao
-```
-
-Sem perguntas, leve, e com o painel só em `127.0.0.1`: sem o socket do Docker, sem acesso ao sistema de arquivos do computador e sem root. Detalhes em [o que a instalação de estação acessa](https://github.com/wislanmoraes/pgwho-client/blob/main/ESTACAO.md).
-
-**Num servidor** (equipe, acesso pela rede):
+Numa pasta sua:
 
 ```bash
 mkdir -p ~/pgwho && cd ~/pgwho
 curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/install.sh | bash
 ```
 
-Sem `--estacao` nem `--servidor`, num computador pessoal (macOS, Docker Desktop, OrbStack ou WSL) o instalador pergunta qual das duas, com a estação como padrão.
+- **No seu computador** (macOS, Windows com WSL2, Docker Desktop ou OrbStack), o instalador já instala para uso só seu: sem perguntas, leve, com o painel só em `127.0.0.1`, sem o socket do Docker, sem acesso ao sistema de arquivos do computador e sem root. Detalhes em [o que a instalação de estação acessa](https://github.com/wislanmoraes/pgwho-client/blob/main/ESTACAO.md).
+- **Num Linux**, ele pergunta como você vai abrir o painel: só nessa máquina (o padrão) ou de outros computadores, pela rede.
 
-1. No servidor, o instalador confere o Docker e o servidor e pergunta só três coisas: um domínio (opcional, para HTTPS com certificado automático), a porta do painel e, se quiser, uma chave de IA.
+**Servidor para a equipe** (painel pela rede, HTTPS, atualização pela tela): acrescente `--servidor`. Requisitos na tabela abaixo.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/install.sh | bash -s -- --servidor
+```
+
+Para trocar depois, rode o instalador de novo na mesma pasta com `--servidor` ou `--estacao`: o banco, as instâncias, o histórico e a licença ficam.
+
+1. Como servidor, o instalador confere o Docker e o servidor e pergunta só três coisas: um domínio (opcional, para HTTPS com certificado automático), a porta do painel e, se quiser, uma chave de IA.
 2. No final, ele mostra o endereço e a **senha inicial do admin**. Anote: ela aparece só ali, e o primeiro acesso pede uma senha nova.
 3. Ative a licença em **Configurações › Licença**, com o código `PGW-...` ou o documento recebido no Portal do Cliente. A edição Pessoal é grátis: o cadastro é em [pgwho.com](https://pgwho.com).
 
