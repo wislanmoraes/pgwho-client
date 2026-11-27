@@ -41,12 +41,25 @@ O que cada edição inclui: [pgwho.com/#planos](https://pgwho.com/#planos).
 
 ## Instalação
 
+Numa pasta sua:
+
 ```bash
 mkdir -p ~/pgwho && cd ~/pgwho
 curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/install.sh | bash
 ```
 
-1. O instalador confere o Docker e o servidor, e pergunta só três coisas: um domínio (opcional, para HTTPS com certificado automático), a porta do painel e, se quiser, uma chave de IA.
+- **No seu computador** (macOS, Windows com WSL2, Docker Desktop ou OrbStack), o instalador já instala para uso só seu: sem perguntas, leve, com o painel só em `127.0.0.1`, sem o socket do Docker, sem acesso ao sistema de arquivos do computador e sem root. Detalhes em [o que a instalação de estação acessa](https://github.com/wislanmoraes/pgwho-client/blob/main/ESTACAO.md).
+- **Num Linux**, ele pergunta como você vai abrir o painel: só nessa máquina (o padrão) ou de outros computadores, pela rede.
+
+**Servidor para a equipe** (painel pela rede, HTTPS, atualização pela tela): acrescente `--servidor`. Requisitos na tabela abaixo.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/install.sh | bash -s -- --servidor
+```
+
+Para trocar depois, rode o instalador de novo na mesma pasta com `--servidor` ou `--estacao`: o banco, as instâncias, o histórico e a licença ficam.
+
+1. Como servidor, o instalador confere o Docker e o servidor e pergunta só três coisas: um domínio (opcional, para HTTPS com certificado automático), a porta do painel e, se quiser, uma chave de IA.
 2. No final, ele mostra o endereço e a **senha inicial do admin**. Anote: ela aparece só ali, e o primeiro acesso pede uma senha nova.
 3. Ative a licença em **Configurações › Licença**, com o código `PGW-...` ou o documento recebido no Portal do Cliente. A edição Pessoal é grátis: o cadastro é em [pgwho.com](https://pgwho.com).
 
@@ -89,7 +102,8 @@ No PostgreSQL:
 
 | | |
 |---|---|
-| Sistema | Linux x86_64 (amd64) com Docker e o plugin Compose (`docker compose`). Também roda no Docker Desktop e no WSL. |
+| Sistema | Linux x86_64 (amd64) com Docker e o plugin Compose (`docker compose`). Também roda no Docker Desktop e no WSL. A estação precisa do Compose 2.24 ou mais novo. |
+| Estação (seu computador) | **2 CPUs e 4 GB** disponíveis para o Docker |
 | Servidor recomendado | **6 CPUs e 12 GB** até 5 instâncias · 8 CPUs e 24 GB até 15 · 12 CPUs e 40 GB acima disso |
 | Disco | Pelo menos **4 GB livres** para atualizar (as imagens novas são baixadas antes de trocar as antigas) |
 | Rede | Saída na porta 443. Entrada na porta do painel ou, com domínio, nas portas 80 e 443 |
@@ -129,6 +143,7 @@ curl -fsSL https://raw.githubusercontent.com/wislanmoraes/pgwho-client/main/inst
 - **Senhas das instâncias:** são guardadas cifradas com a `PGWHO_ENCRYPTION_KEY`, gerada no `.env`. **Faça backup do `.env` junto com o backup do banco**: sem a chave, um banco restaurado não abre as senhas.
 - **Nas instâncias monitoradas:** os scripts de diagnóstico rodam em sessões somente leitura (`default_transaction_read_only`) e com `lock_timeout`, para nunca enfileirar a aplicação atrás de um lock.
 - **No servidor do pgwho:** o backend lê `/proc`, `/sys` e `/` em modo somente leitura (tela de saúde do servidor) e usa o socket do Docker (terminal e saúde dos containers). O serviço de atualização também usa o socket, para trocar as imagens pela interface.
+- **Na estação:** nada disso. Sem socket do Docker, sem `/`, `/proc` ou `/sys`, sem serviço de atualização e sem root; a atualização é pelo `./update.sh`. Se a instalação subir sem essas restrições, o backend se recusa a subir.
 - **Saída de rede:** download das imagens em `ghcr.io`, verificação da licença em `pgwho.com` (existe ativação offline) e o provedor de IA, se você configurar um.
 
 ## Suporte
